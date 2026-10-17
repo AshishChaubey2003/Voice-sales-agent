@@ -424,11 +424,27 @@ VOICE_MAX_CALL_SECONDS=300                             # caps the worst case per
 VOICE_MAX_CONCURRENT_CALLS=1                           # bounds how many pipelines run at once
 ```
 
-How the guards behave: the bot refuses a call once `VOICE_MAX_CONCURRENT_CALLS`
-is reached (logged, and the extra call is ended), and a watchdog ends any call
-that passes `VOICE_MAX_CALL_SECONDS`. The guard **logic** is unit-tested; its
-wiring into the live pipeline is **not yet confirmed with a real call** — do one
-test call that runs past the limit before you trust it in public.
+How the guards behave: the bot runs every call through `run_with_call_guards`
+(`voice/limits.py`), which `run_session` calls on the live path. It refuses a
+call once `VOICE_MAX_CONCURRENT_CALLS` is reached — the refused call is
+cancelled and never runs the pipeline — and a watchdog ends any call that passes
+`VOICE_MAX_CALL_SECONDS`, releasing the slot in a `finally` so a crash cannot
+leak it. This path is covered by regression tests with a fake runner
+(`tests/test_limits.py`): they assert the slot is released on success, on
+refusal, on a `run()` exception, and that the watchdog cancels a long call.
+What the tests do **not** cover is the real Pipecat `WorkerRunner` and a live
+audio call — do one test call that runs past the limit before trusting it in
+public.
+
+**Limitation — the guard is per process (important for #4):** the limiter is a
+module-level counter in the runner process, so it bounds concurrent calls within
+**one** process. It does **not** coordinate across multiple replicas or a
+scaled-out deployment: two replicas with `VOICE_MAX_CONCURRENT_CALLS=1` allow
+two simultaneous calls in total, one each. For a single free-tier Space (one
+replica, one process) this is exactly right and is the recommended shape. If you
+ever scale to more than one replica, move the counter to shared state (for
+example a Redis `INCR`/`DECR` with a TTL) or put a one-at-a-time limit in front
+of the service; until then, keep the voice bot at a single replica.
 
 Still missing: there is no user authentication, and leads are read with
 `python -m scripts.list_leads`, not over an authenticated HTTP endpoint. Keep
@@ -450,10 +466,64 @@ personal details, because the consent gate stores a name and email.
 
 | Check | Result |
 |---|---|
-| `python -m pytest -q` | **PASS** — see the audit report |
+| `python -m pytest -q` | **PASS** — 89 tests, PostgreSQL 16 + pgvector 0.6.0, Python 3.13 |
 | Config validation, health/readiness endpoints | **PASS** |
 | ICE parsing and call-guard logic | **PASS** (unit tests) |
-| `docker build` | **NOT TESTED** — no Docker daemon in the build environment. Build it yourself before deploying. |
+| Call-guard wiring on the run path (limiter + watchdog) | **PASS** — regression tests with a fake runner (not the real `WorkerRunner`) |
+| Bot container start command (`-t webrtc --host --port`) | **PASS** — flags parse via the runner's argument parser |
+| `docker build` (both images) | **BLOCKED** — no Docker daemon in this environment. Build commands are in 6.4; run them on your machine. |
 | Live WebRTC call through STUN/TURN | **NOT TESTED** — no browser, microphone or public host here |
-| Model baking at build time | **NOT TESTED** — the model host is not reachable from the build environment |
+| Model baking at build time | **NOT TESTED** — the model host is not reachable from this environment |
 | Neon connection | **NOT TESTED** — no Neon project; forbidden to create one |
+| Cross-replica concurrency limit | **FAIL by design** — the limiter is per process; see 6.6. Keep one replica. |
+
+### 6.9 Exact configuration and credentials per service
+
+Set every secret through the provider's secret manager (Hugging Face Space
+secrets, Render environment groups, Neon's dashboard) — never in the repo. The
+account to open for each external credential is named.
+
+**Voice bot — Hugging Face Docker Space (port 7860)**
+
+| Variable | Value / source |
+|---|---|
+| `DATABASE_URL` | the Neon async URL (see below) |
+| `DB_SSL` | `require` |
+| `DB_PREPARED_STATEMENT_CACHE_SIZE` | `0` if using Neon's `-pooler` host |
+| `REDIS_ENABLED` | `false` (the bot does not use Redis) |
+| `GROQ_API_KEY` | console.groq.com → API Keys |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` |
+| `TTS_PROVIDER` + `DEEPGRAM_API_KEY` | `deepgram` + console.deepgram.com key |
+| `VOICE_AGENT_ID` | printed by `python -m scripts.seed_demo` against Neon |
+| `PIPECAT_ICE_SERVERS` | STUN URL + TURN URL/username/credential (see TURN below) |
+| `PIPECAT_ALLOWED_ORIGINS` | the Space's public origin, e.g. `https://<user>-<space>.hf.space` |
+| `VOICE_MAX_CALL_SECONDS`, `VOICE_MAX_CONCURRENT_CALLS` | `300`, `1` |
+
+**Text chat API — separate service (Render web service, port 8001)**
+
+Same `DATABASE_URL` / `DB_SSL` / Groq / TTS variables as above, plus Redis:
+set `REDIS_ENABLED=true` with `REDIS_PASSWORD`/`REDIS_HOST`/`REDIS_PORT` only if
+you attach a Redis/Key Value instance, otherwise `REDIS_ENABLED=false`. The API
+does not need the `PIPECAT_*` or `VOICE_*` variables. For a demo you can skip the
+API entirely — the voice bot is the public piece.
+
+**Neon (PostgreSQL + pgvector)**
+
+- Account: neon.tech. Create a project; copy the connection string.
+- Rewrite it to `postgresql+asyncpg://USER:PASSWORD@HOST/DB`, add `DB_SSL=require`
+  (not `?sslmode=` — asyncpg rejects it). For the `-pooler` host also set
+  `DB_PREPARED_STATEMENT_CACHE_SIZE=0`.
+- Credentials needed: the Neon role's user and password (in `DATABASE_URL`).
+- Run `alembic upgrade head`, `seed_demo`, `ingest_knowledge` once against it
+  (section 4) before starting the services.
+
+**TURN provider (the piece that makes a public call work)**
+
+- A TURN relay is required for visitors behind strict NAT / mobile CGNAT; STUN
+  alone is not enough (6.2). Options: a managed TURN service (for example
+  Cloudflare's TURN, Twilio's Network Traversal Service, Metered) or self-hosted
+  coturn on a small VM.
+- Credentials needed: the TURN server URL, a username, and a credential. Put
+  them in `PIPECAT_ICE_SERVERS` as a JSON array alongside a STUN URL (6.2).
+- Google's public STUN (`stun:stun.l.google.com:19302`) is free for the STUN
+  part; there is no free public TURN you should rely on for a real demo.

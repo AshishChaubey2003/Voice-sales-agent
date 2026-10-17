@@ -40,7 +40,7 @@ from voice.lead_tool import (
     build_save_lead_handler,
     build_save_lead_schema,
 )
-from voice.limits import CallLimiter, call_duration_watchdog
+from voice.limits import CallLimiter, run_with_call_guards
 from voice.metrics_observer import ServiceTTFBObserver
 from voice.rag import KnowledgeInjector
 from voice.turn_recorder import VoiceTurnRecorder
@@ -306,27 +306,15 @@ async def run_session(transport, runner_args, settings, session_factory):
         except Exception:
             logger.warning(f"Could not mark conversation {conversation_id} as ended")
 
-    # Bound concurrent calls so a public URL cannot run many pipelines at once.
-    limiter = get_call_limiter(settings)
-    if not limiter.try_acquire():
-        logger.warning(
-            f"Refusing call: {limiter.active}/{limiter.max_concurrent} "
-            "concurrent calls already in progress"
-        )
-        await runner.cancel()
-        await cleanup()
-        return
-
-    # Stop a call that runs past the configured limit (for example a tab left open).
-    watchdog = asyncio.create_task(
-        call_duration_watchdog(settings.voice_max_call_seconds, runner.cancel)
+    # Run under the concurrency limiter and duration watchdog (see voice/limits.py).
+    # The guard is process-local: it bounds concurrent calls within this runner
+    # process, not across replicas. See DEPLOYMENT.md section 6.6.
+    await run_with_call_guards(
+        runner=runner,
+        limiter=get_call_limiter(settings),
+        max_call_seconds=settings.voice_max_call_seconds,
+        cleanup=cleanup,
     )
-    try:
-        await runner.run()
-    finally:
-        watchdog.cancel()
-        limiter.release()
-        await cleanup()
 
 
 async def bot(runner_args: RunnerArguments):
