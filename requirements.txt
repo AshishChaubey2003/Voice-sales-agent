@@ -8,8 +8,10 @@ httpx>=0.27
 sqlalchemy[asyncio]>=2.0
 alembic>=1.13
 groq>=0.9
-pipecat-ai[groq,silero,runner,webrtc]>=1.8
 loguru
+# One line only: a second pipecat-ai requirement silently shadowed the first.
+# Ranges are intentional for local development. Pin before deploying, so the
+# build matches what the tests ran against (see DEPLOYMENT.md).
 pipecat-ai[groq,silero,runner,webrtc,deepgram]>=1.8
 fastembed
 pgvector

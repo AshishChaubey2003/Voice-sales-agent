@@ -1,0 +1,44 @@
+# Text chat API image — the FastAPI service (/healthz, /readyz, /v1/conversations).
+# Separate from the voice bot (see Dockerfile) because each binds its own port;
+# a single-port host runs one of the two, not both.
+FROM python:3.13-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    EMBEDDING_CACHE_DIR=/app/.models \
+    PORT=8001
+
+WORKDIR /app
+
+COPY requirements.lock.txt ./
+RUN pip install -r requirements.lock.txt
+
+ARG BAKE_EMBEDDING_MODEL=true
+ARG EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+RUN if [ "$BAKE_EMBEDDING_MODEL" = "true" ]; then \
+      python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='$EMBEDDING_MODEL', cache_dir='$EMBEDDING_CACHE_DIR')" \
+      || echo "WARNING: embedding model not baked; it will download on first run"; \
+    fi
+
+COPY . .
+
+# Run as a non-root user; /app (incl. /app/.models) is chowned to stay writable.
+RUN useradd --create-home --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8001
+
+# Uses the real readiness endpoint, which checks Postgres (and Redis when enabled).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/readyz', timeout=4).status==200 else 1)" || exit 1
+
+# Migrations, seeding and ingestion are explicit operational steps, not run on
+# boot — see DEPLOYMENT.md. This command only serves the API.
+CMD ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8001"]

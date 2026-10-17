@@ -1,0 +1,35 @@
+# Secrets and local state must never enter an image layer.
+.env
+.env.*
+!.env.example
+
+# Version control and CI
+.git
+.gitignore
+.github
+
+# Python caches and local virtualenvs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Downloaded models and logs (the model is baked in a dedicated build step)
+.models/
+*.log
+
+# Local test audio
+*.wav
+*.mp3
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docs that do not belong in the runtime image
+day1-audit-report.md
