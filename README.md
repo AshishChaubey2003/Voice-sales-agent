@@ -25,7 +25,7 @@ Demo video: *coming soon*
 | **Lead capture with a consent gate** | The assistant calls a `save_lead` tool, but application code decides: the lead is stored only if the assistant read the name and email back and the visitor clearly agreed |
 | **No overpromising** | The assistant only says details were passed to sales after the lead is actually stored, and never promises when someone will get in touch |
 | **Prompt-injection resistance** | Retrieved documents are treated as data, not instructions; requests to "ignore your rules" are declined |
-| **Turn-taking and barge-in** | Silero VAD plus a smart-turn model; the bot stops when the visitor interrupts |
+| **Turn-taking and barge-in** | Silero VAD decides when the visitor has started and stopped speaking; the bot stops when the visitor interrupts |
 | **Transcripts and latency saved** | Every voice and text message is stored with per-turn timings, knowledge search time and sources |
 | **Swappable TTS provider** | `TTS_PROVIDER=groq` or `deepgram` in `.env`, no code change |
 | **Multi-tenant-ready schema** | Every table carries `organization_id`; composite foreign keys stop cross-company links, and knowledge search is filtered by company in SQL |
@@ -38,7 +38,7 @@ Demo video: *coming soon*
 ```mermaid
 flowchart LR
     Browser["Browser<br/>(mic + speaker)"] <-->|WebRTC| Bot["Pipecat voice bot"]
-    Bot --> VAD["Silero VAD +<br/>smart turn detection"]
+    Bot --> VAD["Silero VAD<br/>(turn detection)"]
     VAD --> STT["Groq Whisper<br/>(speech-to-text)"]
     STT --> KB["Knowledge injector<br/>(hybrid search)"]
     KB --> LLM["Groq gpt-oss-20b<br/>(LLM + save_lead tool)"]
@@ -80,7 +80,7 @@ flowchart LR
 | Layer | Choice |
 |---|---|
 | Backend API | Python 3.12, FastAPI, Pydantic v2 |
-| Voice pipeline | Pipecat (SmallWebRTC transport, Silero VAD, smart turn detection, function calling) |
+| Voice pipeline | Pipecat (SmallWebRTC transport, Silero VAD for turn detection, function calling) |
 | Speech-to-text | Groq Whisper |
 | LLM | Groq `openai/gpt-oss-20b` with tool calling |
 | Text-to-speech | Deepgram Aura-2 (Groq Orpheus also supported) |
@@ -254,7 +254,7 @@ docker-compose.yml
 - [x] Lead capture with tool calling and a code-side consent gate
 - [ ] Automated evaluation set for retrieval, answers and lead capture
 - [ ] Embeddable website widget
-- [ ] Better turn detection (merge fragmented visitor turns)
+- [ ] Better turn detection — a dedicated end-of-turn model and merging fragmented visitor turns (today it is Silero VAD only)
 - [ ] LangGraph agent orchestration
 - [ ] Calendar booking and CRM sync behind a permission model
 - [ ] Authentication, leads dashboard, rate limiting, PII handling
