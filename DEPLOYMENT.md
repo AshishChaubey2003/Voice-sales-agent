@@ -297,3 +297,163 @@ Measured on Linux with Python 3.13, as resident memory after import:
 The embedding model is **not** included — it could not be downloaded in the
 measurement environment. Budget for it on top, and measure the real peak
 during a live call on the target host before choosing a machine size.
+
+---
+
+## 6. Deployment (Day 2 changes)
+
+Section 5 lists the blockers the Day 1 audit found. This section records what
+the Day 2 changes did about each, the platform decision, and the exact steps.
+What is implemented here was unit-tested; what needs a live call to confirm is
+marked so. Provider sizes and free-tier quotas are deliberately not quoted —
+check the provider's pricing page when you deploy.
+
+### 6.1 Status of the section 5 blockers
+
+| Blocker | Status after Day 2 |
+|---|---|
+| 5.1 ICE servers | **Configurable, not auto-fixed.** The bot now reads `PIPECAT_ICE_SERVERS`, validates it, and logs at startup whether a remote visitor can connect (warns loudly when it is unset or STUN-only). You still have to supply a STUN URL and a TURN relay. |
+| 5.2 Two processes, one port | **Decided:** two separate services. `Dockerfile` runs the voice bot (port 7860); `Dockerfile.api` runs the API (port 8001). A single-port host runs the voice bot; the API goes to a second service. |
+| 5.3 Auth / abuse | **Partly closed.** `VOICE_MAX_CALL_SECONDS` and `VOICE_MAX_CONCURRENT_CALLS` are enforced in the bot; `PIPECAT_ALLOWED_ORIGINS` is documented. There is still no user authentication — see 6.6. |
+| 5.4 Reproducible build | **Closed.** `requirements.lock.txt` is generated from the environment where the 67 tests passed, and both Dockerfiles install from it. |
+| 5.5 Model downloaded at runtime | **Closed for Docker.** Both Dockerfiles bake the model into the image at build time (`BAKE_EMBEDDING_MODEL`), so a cold start does not re-download it. |
+| 5.6 Memory | Unchanged; still measure the real peak on the target host. |
+
+### 6.2 Verified facts behind the WebRTC decision
+
+From the official Pipecat SmallWebRTC documentation (checked October 2026):
+
+- With no ICE servers, the transport **gathers host candidates only** — which is
+  why localhost works and any other network does not.
+- For production it lists **STUN as required and TURN as recommended**. STUN
+  alone is not guaranteed across symmetric NAT or mobile CGNAT.
+- Browsers block microphone access on insecure origins, so the public URL
+  **must be HTTPS**. Hugging Face Spaces and Render both terminate TLS for you.
+
+`PIPECAT_ICE_SERVERS` accepts the same values the runner's `--ice-servers` flag
+does: comma-separated bare URLs, or a JSON array of objects with `urls` and
+optional `username`/`credential`:
+
+```bash
+# STUN only — direct connections work, strict NAT may fail
+PIPECAT_ICE_SERVERS=stun:stun.l.google.com:19302
+
+# STUN + TURN — what actually makes a public demo reliable
+PIPECAT_ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:turn.example.com:3478","username":"user","credential":"secret"}]
+```
+
+The bot logs its ICE status on startup. If you see
+`PIPECAT_ICE_SERVERS is not set: the bot will gather host candidates only`,
+no remote visitor can connect yet.
+
+Transport is **not** changed to Daily. The SmallWebRTC + TURN route is a
+configuration change and keeps the architecture as it is. If TURN proves hard
+to obtain, Daily remains the alternative (audit report, section 7), added as a
+second switchable transport rather than a replacement.
+
+### 6.3 Platform choice
+
+| Platform | Verdict |
+|---|---|
+| **Hugging Face Spaces (Docker)** | Suitable for the **voice bot**. It runs a Docker image on port 7860 over HTTPS. Storage is ephemeral, so the baked-in model matters; set secrets as Space secrets. |
+| **Render** | Suitable for the **API** and a hosted Postgres. Its small instances are tight for the bot's memory; measure first. |
+| **Neon** | The hosted Postgres (section 4). |
+
+Recommended free-tier shape: voice bot on a Spaces Docker Space, API + Postgres
+elsewhere (or skip the hosted API for a demo, since the bot is the public piece),
+Neon for the database, a TURN provider for `PIPECAT_ICE_SERVERS`.
+
+**Do not assume HTTP support means WebRTC audio works.** A host can serve the
+signaling page over HTTPS and still fail the media path without a TURN relay.
+Prove it with a real call from mobile data (6.7), not from the same network as
+the server.
+
+For a Hugging Face **Docker Space**, the Space's own README needs this front
+matter (keep it in the Space repo, not necessarily in this GitHub README):
+
+```yaml
+---
+title: Voice Sales Agent
+sdk: docker
+app_port: 7860
+---
+```
+
+### 6.4 Build
+
+```bash
+# Voice bot (the public demo)
+docker build -t voice-bot .
+
+# Text chat API (separate service)
+docker build -f Dockerfile.api -t voice-api .
+
+# Skip baking the model (smaller image, slower first call):
+docker build --build-arg BAKE_EMBEDDING_MODEL=false -t voice-bot .
+```
+
+Supported Python: **3.13** (the image base and the lock file) or 3.12. If you
+build on 3.12, regenerate `requirements.lock.txt` on 3.12 first — one pinned
+package (`audioop-lts`) is a 3.13-only backport.
+
+### 6.5 Run order on the host
+
+Migrations, seeding and ingestion are **explicit operational steps**, not run on
+container boot, so a restart never silently re-ingests or touches data. Run them
+once against the hosted database (from your machine or a one-off job), as in
+section 4, then start the services:
+
+```bash
+# one-off, against the hosted DB
+alembic upgrade head
+python -m scripts.seed_demo
+python -m scripts.ingest_knowledge
+
+# then the long-running services (the container CMDs do exactly this)
+python -m voice.bot -t webrtc --host 0.0.0.0 --port 7860
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8001
+```
+
+### 6.6 Protecting the demo
+
+Set all of these before putting the URL on LinkedIn:
+
+```bash
+PIPECAT_ALLOWED_ORIGINS=https://your-space.hf.space   # not the default "*"
+VOICE_MAX_CALL_SECONDS=300                             # caps the worst case per visitor
+VOICE_MAX_CONCURRENT_CALLS=1                           # bounds how many pipelines run at once
+```
+
+How the guards behave: the bot refuses a call once `VOICE_MAX_CONCURRENT_CALLS`
+is reached (logged, and the extra call is ended), and a watchdog ends any call
+that passes `VOICE_MAX_CALL_SECONDS`. The guard **logic** is unit-tested; its
+wiring into the live pipeline is **not yet confirmed with a real call** — do one
+test call that runs past the limit before you trust it in public.
+
+Still missing: there is no user authentication, and leads are read with
+`python -m scripts.list_leads`, not over an authenticated HTTP endpoint. Keep
+the leads data behind the script, and tell demo visitors not to enter real
+personal details, because the consent gate stores a name and email.
+
+### 6.7 Verifying a real deployment
+
+1. **API container:** `curl https://<api-host>/readyz` → `200 {"status":"ready",…}`.
+2. **Database:** `python -m scripts.search_knowledge "How much is the Pro plan?"`
+   against the hosted DB returns the Pro plan chunk.
+3. **Voice, the test localhost cannot do:** open the bot URL **on mobile data**
+   (not the server's Wi-Fi) and complete a call. This is the only proof that
+   STUN/TURN and the media path actually work.
+4. **Re-measure latency** and quote the new number. The README's 1,751 ms median
+   was laptop-local; a hosted call with a TURN relay in the path will be slower.
+
+### 6.8 What could not be tested in this environment
+
+| Check | Result |
+|---|---|
+| `python -m pytest -q` | **PASS** — see the audit report |
+| Config validation, health/readiness endpoints | **PASS** |
+| ICE parsing and call-guard logic | **PASS** (unit tests) |
+| `docker build` | **NOT TESTED** — no Docker daemon in the build environment. Build it yourself before deploying. |
+| Live WebRTC call through STUN/TURN | **NOT TESTED** — no browser, microphone or public host here |
+| Model baking at build time | **NOT TESTED** — the model host is not reachable from the build environment |
+| Neon connection | **NOT TESTED** — no Neon project; forbidden to create one |

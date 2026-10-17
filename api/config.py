@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     deepgram_api_key: SecretStr | None = None
     deepgram_tts_voice: str = "aura-2-helena-en"
 
+    # Voice call guards for a public demo (protect paid Groq/Deepgram/TURN quota).
+    # None or 0 means no cap.
+    voice_max_call_seconds: int | None = None
+    voice_max_concurrent_calls: int = 1
+
     # Knowledge base (RAG)
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_cache_dir: str = ".models"

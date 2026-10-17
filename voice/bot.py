@@ -1,9 +1,8 @@
 import asyncio
+import os
 from datetime import UTC, datetime
 
 from loguru import logger
-from sqlalchemy import select, update
-
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import TTSSpeakFrame
@@ -26,6 +25,7 @@ from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.groq.tts import GroqTTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.workers.runner import WorkerRunner
+from sqlalchemy import select, update
 
 from api.config import get_settings
 from api.db import build_engine, build_session_factory
@@ -34,14 +34,26 @@ from api.knowledge import GROUNDING_RULES
 from api.leads import LEAD_CAPTURE_RULES
 from api.llm import GroqLLM
 from api.models import Agent, Conversation, Message
+from voice.ice import ICE_ENV_VAR, describe_ice_env
 from voice.lead_tool import (
     VOICE_LEAD_RULES,
     build_save_lead_handler,
     build_save_lead_schema,
 )
+from voice.limits import CallLimiter, call_duration_watchdog
 from voice.metrics_observer import ServiceTTFBObserver
 from voice.rag import KnowledgeInjector
 from voice.turn_recorder import VoiceTurnRecorder
+
+# One runner process serves every call, so the limiter is shared across calls.
+_call_limiter: CallLimiter | None = None
+
+
+def get_call_limiter(settings) -> CallLimiter:
+    global _call_limiter
+    if _call_limiter is None:
+        _call_limiter = CallLimiter(settings.voice_max_concurrent_calls)
+    return _call_limiter
 
 VOICE_RULES = """Voice conversation rules (these override any earlier rule about language or format):
 - Your replies are spoken aloud. Never use emojis, markdown, bullet points, or lists.
@@ -106,6 +118,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     settings = get_settings()
     if settings.voice_agent_id is None:
         raise RuntimeError("VOICE_AGENT_ID is missing in .env")
+
+    # Say at startup whether a remote visitor can actually connect. Without ICE
+    # servers the transport gathers host candidates only, which works on
+    # localhost and silently fails everywhere else.
+    ice = describe_ice_env(os.getenv(ICE_ENV_VAR))
+    if ice.ok_for_public_call:
+        logger.info(ice.summary())
+    else:
+        logger.warning(ice.summary())
 
     engine = build_engine()
     session_factory = build_session_factory(engine)
@@ -268,9 +289,7 @@ async def run_session(transport, runner_args, settings, session_factory):
         logger.info("Visitor disconnected")
         await runner.cancel()
 
-    try:
-        await runner.run()
-    finally:
+    async def cleanup() -> None:
         try:
             await rewriter.close()
         except Exception:
@@ -286,6 +305,28 @@ async def run_session(transport, runner_args, settings, session_factory):
             logger.info(f"Voice conversation ended: {conversation_id}")
         except Exception:
             logger.warning(f"Could not mark conversation {conversation_id} as ended")
+
+    # Bound concurrent calls so a public URL cannot run many pipelines at once.
+    limiter = get_call_limiter(settings)
+    if not limiter.try_acquire():
+        logger.warning(
+            f"Refusing call: {limiter.active}/{limiter.max_concurrent} "
+            "concurrent calls already in progress"
+        )
+        await runner.cancel()
+        await cleanup()
+        return
+
+    # Stop a call that runs past the configured limit (for example a tab left open).
+    watchdog = asyncio.create_task(
+        call_duration_watchdog(settings.voice_max_call_seconds, runner.cancel)
+    )
+    try:
+        await runner.run()
+    finally:
+        watchdog.cancel()
+        limiter.release()
+        await cleanup()
 
 
 async def bot(runner_args: RunnerArguments):

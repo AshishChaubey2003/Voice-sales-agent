@@ -40,6 +40,15 @@ def test_valid_local_settings_are_accepted():
     assert settings.redis_enabled is True
 
 
+def test_voice_call_guard_defaults_and_overrides():
+    assert build().voice_max_concurrent_calls == 1
+    assert build().voice_max_call_seconds is None
+
+    tuned = build(voice_max_call_seconds="300", voice_max_concurrent_calls="2")
+    assert tuned.voice_max_call_seconds == 300
+    assert tuned.voice_max_concurrent_calls == 2
+
+
 def test_database_parts_or_database_url_is_required():
     with pytest.raises(ValidationError) as error:
         Settings(_env_file=None, redis_password="p", **LLM)
