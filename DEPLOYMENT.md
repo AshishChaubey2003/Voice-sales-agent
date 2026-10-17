@@ -342,9 +342,26 @@ PIPECAT_ICE_SERVERS=stun:stun.l.google.com:19302
 PIPECAT_ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:turn.example.com:3478","username":"user","credential":"secret"}]
 ```
 
-The bot logs its ICE status on startup. If you see
+**Where the value actually goes (verified against the code):** the Pipecat
+runner reads `PIPECAT_ICE_SERVERS` at server start, and in its `/api/offer`
+handler builds `IceServer(**server)` for each entry and passes them to the
+`SmallWebRTCConnection` it creates. That connection is handed to `bot()` as
+`SmallWebRTCRunnerArguments.webrtc_connection`, which our `create_transport`
+uses. So the ICE servers reach the transport through the runner — the read in
+`voice/bot.py` is **only** an advisory startup log and does not itself wire the
+transport. Because the config parses does **not** mean a real connection works;
+only a live call (6.7) proves that.
+
+The bot logs its ICE status on startup. The log reports schemes and counts only,
+never usernames or credentials. If you see
 `PIPECAT_ICE_SERVERS is not set: the bot will gather host candidates only`,
 no remote visitor can connect yet.
+
+**Production fail-fast:** when `APP_ENV=production`, the bot refuses to start if
+`PIPECAT_ICE_SERVERS` has no STUN server (or is malformed) or if
+`PIPECAT_ALLOWED_ORIGINS` is unset — so it cannot come up "healthy" and then
+reject every visitor, or serve with wildcard CORS. In development (the default)
+these are warnings, not errors, so local work is unaffected.
 
 Transport is **not** changed to Daily. The SmallWebRTC + TURN route is a
 configuration change and keeps the architecture as it is. If TURN proves hard
@@ -466,12 +483,14 @@ personal details, because the consent gate stores a name and email.
 
 | Check | Result |
 |---|---|
-| `python -m pytest -q` | **PASS** — 89 tests, PostgreSQL 16 + pgvector 0.6.0, Python 3.13 |
+| `python -m pytest -q` | **PASS** — 93 tests, PostgreSQL 16 + pgvector 0.6.0, Python 3.13 |
 | Config validation, health/readiness endpoints | **PASS** |
-| ICE parsing and call-guard logic | **PASS** (unit tests) |
+| ICE parsing, ICE-in-logs has no credentials, production fail-fast gate | **PASS** (unit tests) |
 | Call-guard wiring on the run path (limiter + watchdog) | **PASS** — regression tests with a fake runner (not the real `WorkerRunner`) |
+| ICE → transport path (runner builds `SmallWebRTCConnection` with the servers) | **PASS by inspection** of the installed Pipecat 1.12 runner source |
 | Bot container start command (`-t webrtc --host --port`) | **PASS** — flags parse via the runner's argument parser |
 | `docker build` (both images) | **BLOCKED** — no Docker daemon in this environment. Build commands are in 6.4; run them on your machine. |
+| Dockerfile non-root user + writable model cache | **NOT TESTED** — added, but not build-verified here (no daemon) |
 | Live WebRTC call through STUN/TURN | **NOT TESTED** — no browser, microphone or public host here |
 | Model baking at build time | **NOT TESTED** — the model host is not reachable from this environment |
 | Neon connection | **NOT TESTED** — no Neon project; forbidden to create one |

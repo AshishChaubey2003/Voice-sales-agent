@@ -34,7 +34,13 @@ from api.knowledge import GROUNDING_RULES
 from api.leads import LEAD_CAPTURE_RULES
 from api.llm import GroqLLM
 from api.models import Agent, Conversation, Message
-from voice.ice import ICE_ENV_VAR, describe_ice_env
+from voice.ice import (
+    ICE_ENV_VAR,
+    describe_ice_env,
+    production_config_errors,
+)
+
+ALLOWED_ORIGINS_ENV_VAR = "PIPECAT_ALLOWED_ORIGINS"
 from voice.lead_tool import (
     VOICE_LEAD_RULES,
     build_save_lead_handler,
@@ -127,6 +133,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         logger.info(ice.summary())
     else:
         logger.warning(ice.summary())
+
+    # In production, refuse to start when the public call path is misconfigured,
+    # rather than coming up "healthy" and silently rejecting every visitor.
+    # Development stays permissive (the warning above is enough).
+    blocking = production_config_errors(
+        app_env=settings.app_env,
+        ice=ice,
+        allowed_origins=os.getenv(ALLOWED_ORIGINS_ENV_VAR),
+    )
+    if blocking:
+        raise RuntimeError(
+            "Refusing to start in production: " + " ".join(blocking)
+        )
 
     engine = build_engine()
     session_factory = build_session_factory(engine)

@@ -113,3 +113,35 @@ def describe_ice_env(raw: str | None) -> IceStatus:
         status = IceStatus()
         status.problems.append(f"could not be parsed: {error}")
         return status
+
+
+def production_config_errors(
+    *, app_env: str, ice: IceStatus, allowed_origins: str | None
+) -> list[str]:
+    """Blocking misconfigurations for a public deployment (empty in development).
+
+    Only enforced when app_env is "production", so local development keeps
+    working with no ICE server and permissive CORS. Returned messages are
+    actionable and never contain credentials — ``ice`` carries only schemes and
+    counts, and allowed_origins is checked for presence, not echoed.
+    """
+    if app_env != "production":
+        return []
+
+    errors: list[str] = []
+    if ice.problems:
+        errors.append(
+            f"PIPECAT_ICE_SERVERS is invalid ({'; '.join(ice.problems)}). "
+            "Fix it before deploying."
+        )
+    elif not ice.has_stun:
+        errors.append(
+            "PIPECAT_ICE_SERVERS has no STUN server, so a remote visitor cannot "
+            "connect. Set at least STUN, and a TURN relay for strict NAT."
+        )
+    if not (allowed_origins and allowed_origins.strip()):
+        errors.append(
+            "PIPECAT_ALLOWED_ORIGINS is not set, so CORS defaults to '*'. "
+            "Set it to your public origin before deploying."
+        )
+    return errors

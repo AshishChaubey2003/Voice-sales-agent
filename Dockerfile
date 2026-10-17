@@ -43,6 +43,13 @@ RUN if [ "$BAKE_EMBEDDING_MODEL" = "true" ]; then \
 # Application code last, so editing it does not invalidate the layers above.
 COPY . .
 
+# Run as a non-root user. /app (which holds the baked model cache at
+# /app/.models) is chowned so it stays writable. UID 1000 matches the user
+# Hugging Face Spaces runs containers as.
+RUN useradd --create-home --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 7860
 
 # Reports unhealthy if the runner's HTTP server is not answering, so an
