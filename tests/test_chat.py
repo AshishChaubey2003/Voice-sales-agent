@@ -5,6 +5,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
 
+from api.auth import generate_api_key, hash_api_key
 from api.db import build_engine, build_session_factory
 from api.deps import get_knowledge_search, get_llm
 from api.knowledge import RetrievedChunk, SearchResult
@@ -72,8 +73,13 @@ async def setup():
     app.state.session_factory = session_factory
     app.dependency_overrides[get_knowledge_search] = lambda: fake_search()
 
+    raw_key = generate_api_key()
     async with session_factory() as session:
-        org = Organization(name="Test Co", slug=f"test-{uuid.uuid4().hex[:8]}")
+        org = Organization(
+            name="Test Co",
+            slug=f"test-{uuid.uuid4().hex[:8]}",
+            api_key_hash=hash_api_key(raw_key),
+        )
         session.add(org)
         await session.flush()
         agent = Agent(organization_id=org.id, name="Test Agent", system_prompt="Be brief.")
@@ -81,7 +87,13 @@ async def setup():
         await session.commit()
         org_id, agent_id = org.id, agent.id
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    # Every request from this client is authenticated as the org above, so the
+    # existing tests exercise the real auth path rather than bypassing it.
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {raw_key}"},
+    ) as client:
         yield client, session_factory, agent_id
 
     async with session_factory() as session:

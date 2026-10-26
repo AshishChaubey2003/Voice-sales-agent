@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import get_settings
-from api.deps import get_knowledge_search, get_llm, get_session
+from api.deps import get_current_org, get_knowledge_search, get_llm, get_session
 from api.knowledge import (
     QUERY_REWRITE_PROMPT,
     SearchResult,
@@ -17,7 +17,7 @@ from api.knowledge import (
 )
 from api.leads import LEAD_CAPTURE_RULES, SAVE_LEAD_TOOL, save_lead_from_tool
 from api.llm import LLMClient, LLMError
-from api.models import Agent, Conversation, Message
+from api.models import Agent, Conversation, Message, Organization
 from api.schemas import ChatReply, ConversationCreate, ConversationCreated, MessageCreate
 
 logger = logging.getLogger(__name__)
@@ -43,15 +43,23 @@ async def safe_search(knowledge_search, session, organization_id, query, setting
 async def create_conversation(
     payload: ConversationCreate,
     session: AsyncSession = Depends(get_session),
+    org: Organization = Depends(get_current_org),
 ):
+    # Scope the agent to the authenticated org. An agent id belonging to another
+    # org yields 404, which does not reveal that it exists elsewhere.
     agent = await session.scalar(
-        select(Agent).where(Agent.id == payload.agent_id, Agent.status == "active")
+        select(Agent).where(
+            Agent.id == payload.agent_id,
+            Agent.organization_id == org.id,
+            Agent.status == "active",
+        )
     )
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
     conversation = Conversation(
-        organization_id=agent.organization_id,
+        # The org comes from the authenticated key, never from the request body.
+        organization_id=org.id,
         agent_id=agent.id,
         channel="text",
     )
@@ -67,12 +75,16 @@ async def send_message(
     session: AsyncSession = Depends(get_session),
     llm: LLMClient = Depends(get_llm),
     knowledge_search=Depends(get_knowledge_search),
+    org: Organization = Depends(get_current_org),
 ):
     settings = get_settings()
 
+    # Scope by the authenticated org so a conversation id from another tenant is
+    # not found. This gates both the read of history below and every write.
     conversation = await session.scalar(
         select(Conversation).where(
             Conversation.id == conversation_id,
+            Conversation.organization_id == org.id,
             Conversation.status == "active",
         )
     )

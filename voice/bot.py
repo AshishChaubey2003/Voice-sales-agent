@@ -46,7 +46,7 @@ from voice.lead_tool import (
     build_save_lead_handler,
     build_save_lead_schema,
 )
-from voice.limits import CallLimiter, run_with_call_guards
+from voice.limits import CallLimiter, run_with_call_guards, try_admit
 from voice.metrics_observer import ServiceTTFBObserver
 from voice.rag import KnowledgeInjector
 from voice.turn_recorder import VoiceTurnRecorder
@@ -60,6 +60,36 @@ def get_call_limiter(settings) -> CallLimiter:
     if _call_limiter is None:
         _call_limiter = CallLimiter(settings.voice_max_concurrent_calls)
     return _call_limiter
+
+def check_startup_config(settings=None) -> None:
+    """Fail fast if the process is misconfigured for a public deployment.
+
+    Called once from ``__main__`` before the Pipecat runner starts accepting
+    connections.  A no-op in development (the default ``APP_ENV``); only raises
+    ``SystemExit`` when ``APP_ENV=production`` and ``production_config_errors``
+    returns at least one blocking message.
+
+    ``settings`` may be injected for testing; production code omits it and the
+    cached live Settings object is used.  These tests cover this function
+    directly — the ``__main__`` entry point itself is not under test because it
+    invokes the full Pipecat runner.
+    """
+    if settings is None:
+        settings = get_settings()
+    ice = describe_ice_env(os.getenv(ICE_ENV_VAR))
+    errors = production_config_errors(
+        app_env=settings.app_env,
+        ice=ice,
+        allowed_origins=os.getenv(ALLOWED_ORIGINS_ENV_VAR),
+    )
+    if errors:
+        for msg in errors:
+            logger.error(f"Startup blocked: {msg}")
+        raise SystemExit(
+            "Refusing to start in production with blocking configuration errors. "
+            "Fix the issues above and restart the process."
+        )
+
 
 VOICE_RULES = """Voice conversation rules (these override any earlier rule about language or format):
 - Your replies are spoken aloud. Never use emojis, markdown, bullet points, or lists.
@@ -144,7 +174,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
     if blocking:
         raise RuntimeError(
-            "Refusing to start in production: " + " ".join(blocking)
+            "Per-call production check failed (defense-in-depth): "
+            + " ".join(blocking)
         )
 
     engine = build_engine()
@@ -158,7 +189,62 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             logger.warning("Database engine cleanup skipped during shutdown")
 
 
+async def mark_conversation_ended(session_factory, conversation_id) -> None:
+    """Mark a conversation row as ended. Best-effort — logs on failure."""
+    try:
+        async with session_factory() as db:
+            await db.execute(
+                update(Conversation)
+                .where(Conversation.id == conversation_id)
+                .values(status="ended", ended_at=datetime.now(UTC))
+            )
+            await db.commit()
+        logger.info(f"Voice conversation ended: {conversation_id}")
+    except Exception:
+        logger.warning(f"Could not mark conversation {conversation_id} as ended")
+
+
+class _SessionState:
+    """Mutable state shared between run_session and _run_admitted_session."""
+    __slots__ = ("conversation_id", "rewriter", "slot_handed_over")
+
+    def __init__(self):
+        self.conversation_id = None
+        self.rewriter = None
+        self.slot_handed_over = False
+
+
 async def run_session(transport, runner_args, settings, session_factory):
+    """Admit the call, then delegate to _run_admitted_session.
+
+    The admission check (concurrency limiter) happens BEFORE any database work
+    or persistence, so a refused call creates no conversation row and touches no
+    external state.  If setup fails after the row is created, the finally block
+    marks the row "ended" and releases the call slot.
+    """
+    limiter = get_call_limiter(settings)
+    if not try_admit(limiter):
+        return  # refused — nothing persisted, nothing to clean up
+
+    state = _SessionState()
+    try:
+        await _run_admitted_session(
+            transport, runner_args, settings, session_factory, limiter, state,
+        )
+    finally:
+        if not state.slot_handed_over:
+            limiter.release()
+            if state.conversation_id is not None:
+                await mark_conversation_ended(session_factory, state.conversation_id)
+            if state.rewriter is not None:
+                try:
+                    await state.rewriter.close()
+                except Exception:
+                    logger.warning("Query rewriter cleanup skipped during shutdown")
+
+
+async def _run_admitted_session(transport, runner_args, settings, session_factory, limiter, state):
+    """The body of a call that has already been admitted by the limiter."""
     async with session_factory() as session:
         agent = await session.scalar(
             select(Agent).where(
@@ -177,6 +263,7 @@ async def run_session(transport, runner_args, settings, session_factory):
         await session.commit()
         org_id = agent.organization_id
         conversation_id = conversation.id
+        state.conversation_id = conversation_id
         agent_prompt = agent.system_prompt
 
     logger.info(f"Voice conversation started: {conversation_id}")
@@ -241,6 +328,7 @@ async def run_session(transport, runner_args, settings, session_factory):
         max_output_tokens=200,
         reasoning_effort="low",
     )
+    state.rewriter = rewriter
     knowledge_injector = KnowledgeInjector(
         session_factory=session_factory,
         organization_id=org_id,
@@ -313,26 +401,21 @@ async def run_session(transport, runner_args, settings, session_factory):
             await rewriter.close()
         except Exception:
             logger.warning("Query rewriter cleanup skipped during shutdown")
-        try:
-            async with session_factory() as db:
-                await db.execute(
-                    update(Conversation)
-                    .where(Conversation.id == conversation_id)
-                    .values(status="ended", ended_at=datetime.now(UTC))
-                )
-                await db.commit()
-            logger.info(f"Voice conversation ended: {conversation_id}")
-        except Exception:
-            logger.warning(f"Could not mark conversation {conversation_id} as ended")
+        await mark_conversation_ended(session_factory, conversation_id)
+
+    # Hand the slot to run_with_call_guards — from here the guards own the
+    # limiter release and the cleanup.  The outer finally must not release again.
+    state.slot_handed_over = True
 
     # Run under the concurrency limiter and duration watchdog (see voice/limits.py).
     # The guard is process-local: it bounds concurrent calls within this runner
     # process, not across replicas. See DEPLOYMENT.md section 6.6.
     await run_with_call_guards(
         runner=runner,
-        limiter=get_call_limiter(settings),
+        limiter=limiter,
         max_call_seconds=settings.voice_max_call_seconds,
         cleanup=cleanup,
+        admitted=True,
     )
 
 
@@ -344,4 +427,5 @@ async def bot(runner_args: RunnerArguments):
 if __name__ == "__main__":
     from pipecat.runner.run import main
 
+    check_startup_config()
     main()

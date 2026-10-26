@@ -36,6 +36,12 @@ class Organization(TimestampMixin, Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(200))
     slug: Mapped[str] = mapped_column(String(100), unique=True)
+    # SHA-256 hex digest of the org's API key. Nullable so existing rows remain
+    # valid after migration; an org with no hash simply cannot authenticate.
+    # The raw key is never stored here.
+    api_key_hash: Mapped[str | None] = mapped_column(
+        String(64), unique=True, nullable=True
+    )
 
 
 class Agent(TimestampMixin, Base):
@@ -171,4 +177,4 @@ class Lead(TimestampMixin, Base):
         ),
         UniqueConstraint("organization_id", "conversation_id"),
         Index("ix_leads_org_created", "organization_id", "created_at"),
-    )       
+    )
