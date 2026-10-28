@@ -6,6 +6,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
 
 from api.auth import generate_api_key, hash_api_key
+from api.chat import safe_search
 from api.db import build_engine, build_session_factory
 from api.deps import get_knowledge_search, get_llm
 from api.knowledge import RetrievedChunk, SearchResult
@@ -237,6 +238,51 @@ async def test_lead_is_not_saved_without_read_back_and_confirmation(setup):
     assert response.status_code == 200
     assert response.json()["lead_status"] == "rejected"
     assert await leads_for(session_factory, conversation_id) == []
+
+
+class _FakeRagSettings:
+    rag_top_k = 4
+    rag_max_distance = 0.3
+
+
+@pytest.mark.anyio
+async def test_safe_search_marks_infrastructure_failures_distinctly_from_empty_results():
+    """RAG-02: safe_search's except-clause must not return the same shape for a genuine
+    'nothing relevant' search as for a search that actually raised. This test needs no
+    database and no running app - it calls the pure function directly."""
+
+    async def raising_search(session, organization_id, query, top_k=4, max_distance=None):
+        raise RuntimeError("pgvector connection lost")
+
+    result = await safe_search(
+        raising_search, None, uuid.uuid4(), "How much is the Pro plan?", _FakeRagSettings()
+    )
+
+    assert result.chunks == []
+    assert result.error is True
+
+
+@pytest.mark.anyio
+async def test_retrieval_failure_does_not_make_the_agent_claim_the_information_is_missing(setup):
+    """End-to-end: when knowledge_search raises, the system prompt sent to the LLM must not
+    say 'No relevant information was found' (which reads as a confident negative) - it must
+    carry the distinct technical-failure wording instead."""
+    client, _, agent_id = setup
+    fake = FakeLLM()
+    app.dependency_overrides[get_llm] = lambda: fake
+
+    async def raising_search(session, organization_id, query, top_k=4, max_distance=None):
+        raise RuntimeError("pgvector connection lost")
+
+    app.dependency_overrides[get_knowledge_search] = lambda: raising_search
+
+    conversation_id = await start_conversation(client, agent_id)
+    response = await send(client, conversation_id, "How much is the Pro plan?")
+
+    assert response.status_code == 200
+    assert "No relevant information was found" not in fake.prompts[0]
+    assert "technical problem" in fake.prompts[0]
+    assert response.json()["sources"] == []
 
 
 @pytest.mark.anyio

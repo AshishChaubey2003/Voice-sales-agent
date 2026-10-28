@@ -43,6 +43,7 @@ from voice.ice import (
 ALLOWED_ORIGINS_ENV_VAR = "PIPECAT_ALLOWED_ORIGINS"
 from voice.lead_tool import (
     VOICE_LEAD_RULES,
+    PendingLeadSaves,
     build_save_lead_handler,
     build_save_lead_schema,
 )
@@ -50,6 +51,7 @@ from voice.limits import CallLimiter, run_with_call_guards, try_admit
 from voice.metrics_observer import ServiceTTFBObserver
 from voice.rag import KnowledgeInjector
 from voice.turn_recorder import VoiceTurnRecorder
+from voice.voice_auth import install_voice_auth, production_token_errors
 
 # One runner process serves every call, so the limiter is shared across calls.
 _call_limiter: CallLimiter | None = None
@@ -82,6 +84,9 @@ def check_startup_config(settings=None) -> None:
         ice=ice,
         allowed_origins=os.getenv(ALLOWED_ORIGINS_ENV_VAR),
     )
+    token_secret = settings.voice_token_secret
+    token_secret_value = token_secret.get_secret_value() if token_secret else None
+    errors = errors + production_token_errors(settings.app_env, token_secret_value)
     if errors:
         for msg in errors:
             logger.error(f"Startup blocked: {msg}")
@@ -89,6 +94,22 @@ def check_startup_config(settings=None) -> None:
             "Refusing to start in production with blocking configuration errors. "
             "Fix the issues above and restart the process."
         )
+    elif settings.app_env != "production":
+        # DEPLOY-05: these same checks stay a no-op outside production by design, so local
+        # development keeps working with no ICE/CORS setup at all. But that means an
+        # operator who deploys this process publicly and simply forgets to set
+        # APP_ENV=production gets no signal whatsoever today. Surface what WOULD have
+        # blocked startup as a loud warning instead - this never raises and never changes
+        # development behaviour, it only makes the silent gap visible in the startup log.
+        would_block = production_config_errors(
+            app_env="production", ice=ice, allowed_origins=os.getenv(ALLOWED_ORIGINS_ENV_VAR)
+        )
+        for msg in would_block:
+            logger.warning(
+                f"APP_ENV={settings.app_env!r}: this configuration would block startup "
+                f"in production - {msg} If this process is reachable from the public "
+                f"internet, set APP_ENV=production."
+            )
 
 
 VOICE_RULES = """Voice conversation rules (these override any earlier rule about language or format):
@@ -310,12 +331,16 @@ async def _run_admitted_session(transport, runner_args, settings, session_factor
     tts = build_tts(settings)
     logger.info(f"Voice TTS provider: {settings.tts_provider}")
 
+    # VOICE-01: tracked so on_client_disconnected below can wait for an in-flight
+    # save_lead commit instead of cancelling it mid-write.
+    pending_lead_saves = PendingLeadSaves()
     llm.register_function(
         "save_lead",
         build_save_lead_handler(
             session_factory=session_factory,
             organization_id=org_id,
             conversation_id=conversation_id,
+            pending=pending_lead_saves,
         ),
     )
     logger.info("Registered tools: save_lead")
@@ -335,6 +360,7 @@ async def _run_admitted_session(transport, runner_args, settings, session_factor
         settings=settings,
         rewriter=rewriter,
         on_retrieval=recorder.record_retrieval,
+        conversation_id=conversation_id,
     )
 
     context = LLMContext(tools=ToolsSchema(standard_tools=[build_save_lead_schema()]))
@@ -394,6 +420,16 @@ async def _run_admitted_session(transport, runner_args, settings, session_factor
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Visitor disconnected")
+        # VOICE-01: give an in-flight save_lead commit a brief grace period instead of
+        # cancelling it mid-write - a visitor who just said "yes" should not silently lose
+        # their lead because they closed the tab at the exact wrong moment. Bounded so a
+        # genuinely stuck save can never block shutdown forever.
+        idle = await pending_lead_saves.wait_idle(settings.lead_save_disconnect_grace_secs)
+        if not idle:
+            logger.warning(
+                "Visitor disconnected while a save_lead commit was still in flight after "
+                f"waiting {settings.lead_save_disconnect_grace_secs}s; cancelling anyway."
+            )
         await runner.cancel()
 
     async def cleanup() -> None:
@@ -425,7 +461,23 @@ async def bot(runner_args: RunnerArguments):
 
 
 if __name__ == "__main__":
-    from pipecat.runner.run import main
+    from pipecat.runner.run import app, main
 
     check_startup_config()
+    # Installed before main() serves anything, so the token check wraps every
+    # route the runner registers (/start, /api/offer, /sessions/..., webhooks, ws).
+    _voice_secret = get_settings().voice_token_secret
+    install_voice_auth(app, _voice_secret.get_secret_value() if _voice_secret else None)
+    # Browser client source and the local demo page. Not served in production: customers
+    # vendor voice-client.js into their own frontend. Contains no secrets.
+    if get_settings().app_env != "production":
+        from pathlib import Path
+
+        from fastapi.staticfiles import StaticFiles
+
+        app.mount(
+            "/voice-client",
+            StaticFiles(directory=Path(__file__).parent / "static"),
+            name="voice-client",
+        )
     main()

@@ -33,6 +33,11 @@ def _settings(**overrides) -> Settings:
         groq_api_key="dummy-not-a-real-key",
         groq_model="dummy-model",
         redis_password="p",
+        # Production now refuses database connections without TLS (policy). These
+        # tests exercise the ICE/origins guard, so they supply a forced TLS mode.
+        db_ssl="verify-full",
+        # Production also requires a voice token secret (fail closed). Test value only.
+        voice_token_secret="t" * 32,
     )
     defaults.update(overrides)
     return Settings(**defaults)
@@ -56,6 +61,41 @@ def test_startup_passes_in_development_with_valid_config(monkeypatch):
     monkeypatch.setenv("PIPECAT_ICE_SERVERS", VALID_ICE)
     monkeypatch.setenv("PIPECAT_ALLOWED_ORIGINS", VALID_ORIGINS)
     check_startup_config(settings=_settings(app_env="development"))
+
+
+def test_development_without_ice_or_origins_warns_but_does_not_raise(monkeypatch):
+    """DEPLOY-05: an operator who deploys with APP_ENV left at its default must not get
+    total silence about a config that would block a real production start - development
+    stays a no-op (no SystemExit) but now logs a loud warning naming the exact gap."""
+    import voice.bot as bot_module
+
+    monkeypatch.delenv("PIPECAT_ICE_SERVERS", raising=False)
+    monkeypatch.delenv("PIPECAT_ALLOWED_ORIGINS", raising=False)
+    warnings = []
+    monkeypatch.setattr(bot_module.logger, "warning", lambda msg: warnings.append(msg))
+
+    check_startup_config(settings=_settings(app_env="development"))  # must not raise
+
+    joined = " ".join(warnings)
+    assert "APP_ENV='development'" in joined
+    assert "would block startup in production" in joined
+    assert "STUN" in joined
+    assert "PIPECAT_ALLOWED_ORIGINS" in joined
+
+
+def test_development_with_valid_config_warns_about_nothing(monkeypatch):
+    """No false alarms: a development process whose config already satisfies the
+    production rules must not be warned about anything."""
+    import voice.bot as bot_module
+
+    monkeypatch.setenv("PIPECAT_ICE_SERVERS", VALID_ICE)
+    monkeypatch.setenv("PIPECAT_ALLOWED_ORIGINS", VALID_ORIGINS)
+    warnings = []
+    monkeypatch.setattr(bot_module.logger, "warning", lambda msg: warnings.append(msg))
+
+    check_startup_config(settings=_settings(app_env="development"))
+
+    assert warnings == []
 
 
 # ---------------------------------------------------------------------------

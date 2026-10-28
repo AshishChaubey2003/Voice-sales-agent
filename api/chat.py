@@ -19,8 +19,30 @@ from api.leads import LEAD_CAPTURE_RULES, SAVE_LEAD_TOOL, save_lead_from_tool
 from api.llm import LLMClient, LLMError
 from api.models import Agent, Conversation, Message, Organization
 from api.schemas import ChatReply, ConversationCreate, ConversationCreated, MessageCreate
+from api.monitoring import TurnEvent, get_monitor
+from api.redact import find_sensitive
+from api.tracing import turn_inputs, turn_trace
 
 logger = logging.getLogger(__name__)
+
+def _record_turn(conversation, *, ok, error_type=None, llm_ms=None, rag_ms=None, n_sources=None,
+                 lead_status=None, reply_text=None) -> None:
+    """Hands counts and timings to the opt-in online monitor. Never raises, never sends text."""
+    try:
+        monitor = get_monitor()
+        if monitor is None:
+            return
+        secrets = tuple(k for k in find_sensitive(reply_text or "") if k in ("SECRET", "DBURL"))
+        monitor.submit(TurnEvent(
+            turn_id=str(uuid.uuid4()), session_id=str(conversation.id), channel="chat", ok=ok,
+            organization_id=str(conversation.organization_id),
+            error_type=error_type, llm_ms=llm_ms, rag_ms=rag_ms, n_sources=n_sources,
+            lead_status=lead_status, reply_chars=len(reply_text) if reply_text else None,
+            secret_kinds=secrets,
+        ))
+    except Exception:
+        logger.warning("Monitoring event could not be recorded")
+
 
 router = APIRouter(prefix="/v1/conversations", tags=["conversations"])
 
@@ -36,7 +58,9 @@ async def safe_search(knowledge_search, session, organization_id, query, setting
         )
     except Exception:
         logger.exception("Knowledge search failed")
-        return SearchResult(chunks=[], elapsed_ms=0)
+        # error=True: this is an infrastructure failure, not evidence the knowledge base
+        # lacks the answer. Callers must not treat this the same as a genuine empty result.
+        return SearchResult(chunks=[], elapsed_ms=0, error=True)
 
 
 @router.post("", response_model=ConversationCreated, status_code=status.HTTP_201_CREATED)
@@ -98,126 +122,152 @@ async def send_message(
         )
     )
 
-    session.add(
-        Message(
-            organization_id=conversation.organization_id,
-            conversation_id=conversation.id,
-            role="user",
-            content=payload.content,
-        )
-    )
-    await session.commit()
-
-    recent = (
-        await session.scalars(
-            select(Message)
-            .where(
-                Message.conversation_id == conversation.id,
-                Message.organization_id == conversation.organization_id,
+    with turn_trace(
+        "chat_turn",
+        session_id=conversation.id,
+        channel="chat",
+        organization_id=conversation.organization_id,
+        inputs=turn_inputs(payload.content),
+    ) as turn:
+        session.add(
+            Message(
+                organization_id=conversation.organization_id,
+                conversation_id=conversation.id,
+                role="user",
+                content=payload.content,
             )
-            .order_by(Message.created_at.desc())
-            .limit(settings.chat_history_limit)
         )
-    ).all()
-    history = [{"role": m.role, "content": m.content} for m in reversed(recent)]
-
-    search = await safe_search(
-        knowledge_search, session, conversation.organization_id, payload.content, settings
-    )
-
-    # Nothing found: the message may be a follow-up ("and the Business plan?").
-    # Retry once with a standalone query written from the conversation.
-    rewritten_query = None
-    if not search.chunks and len(history) > 1:
         await session.commit()
-        try:
-            rewrite = await llm.generate(QUERY_REWRITE_PROMPT, build_rewrite_input(history))
-            candidate = clean_rewritten_query(rewrite.text)
-        except LLMError:
-            logger.warning("Query rewrite failed for conversation %s", conversation.id)
-            candidate = ""
 
-        if candidate and candidate.lower() != payload.content.lower():
-            retry = await safe_search(
-                knowledge_search, session, conversation.organization_id, candidate, settings
-            )
-            if retry.chunks:
-                search = retry
-                rewritten_query = candidate
-
-    system_prompt = (
-        f"{build_grounded_system_prompt(agent.system_prompt, search.chunks)}\n\n{LEAD_CAPTURE_RULES}"
-    )
-    sources = [chunk.heading for chunk in search.chunks]
-
-    # LLM call kai second le sakta hai: tab tak DB transaction band rakho
-    await session.commit()
-
-    lead_status = None
-    try:
-        result = await llm.generate(system_prompt, history, tools=[SAVE_LEAD_TOOL])
-        llm_ms = result.latency_ms
-
-        if result.tool_calls:
-            # The LLM proposes; the consent gate in save_lead_from_tool decides.
-            tool_messages = []
-            for call in result.tool_calls:
-                if call.name == "save_lead":
-                    outcome = await save_lead_from_tool(
-                        session,
-                        conversation.organization_id,
-                        conversation.id,
-                        history,
-                        call.arguments,
-                    )
-                    lead_status = outcome["status"]
-                else:
-                    outcome = {"status": "rejected", "reason": "Unknown tool."}
-                tool_messages.append(
-                    {"role": "tool", "tool_call_id": call.id, "content": json.dumps(outcome)}
+        recent = (
+            await session.scalars(
+                select(Message)
+                .where(
+                    Message.conversation_id == conversation.id,
+                    Message.organization_id == conversation.organization_id,
                 )
-            await session.commit()
-
-            follow_up = [
-                *history,
-                {
-                    "role": "assistant",
-                    "content": result.text or None,
-                    "tool_calls": [call.to_message_part() for call in result.tool_calls],
-                },
-                *tool_messages,
-            ]
-            result = await llm.generate(
-                system_prompt, follow_up, tools=[SAVE_LEAD_TOOL], tool_choice="none"
+                .order_by(Message.created_at.desc())
+                .limit(settings.chat_history_limit)
             )
-            llm_ms += result.latency_ms
-    except LLMError:
-        logger.exception("LLM call failed for conversation %s", conversation.id)
-        raise HTTPException(
-            status_code=503, detail="AI service temporarily unavailable"
+        ).all()
+        history = [{"role": m.role, "content": m.content} for m in reversed(recent)]
+
+        search = await safe_search(
+            knowledge_search, session, conversation.organization_id, payload.content, settings
         )
 
-    latency = {"llm": llm_ms, "rag": search.elapsed_ms, "rag_sources": sources}
-    if rewritten_query:
-        latency["rag_rewritten_query"] = rewritten_query
-    if lead_status:
-        latency["lead"] = lead_status
+        # Nothing found: the message may be a follow-up ("and the Business plan?").
+        # Retry once with a standalone query written from the conversation.
+        rewritten_query = None
+        # Skipped on an infrastructure error: rewriting cannot fix a failed lookup, and it
+        # would spend an LLM call on a retry the database cannot serve.
+        if not search.chunks and not search.error and len(history) > 1:
+            await session.commit()
+            try:
+                rewrite = await llm.generate(QUERY_REWRITE_PROMPT, build_rewrite_input(history))
+                candidate = clean_rewritten_query(rewrite.text)
+            except LLMError:
+                logger.warning("Query rewrite failed for conversation %s", conversation.id)
+                candidate = ""
 
-    session.add(
-        Message(
-            organization_id=conversation.organization_id,
+            if candidate and candidate.lower() != payload.content.lower():
+                retry = await safe_search(
+                    knowledge_search, session, conversation.organization_id, candidate, settings
+                )
+                if retry.chunks:
+                    search = retry
+                    rewritten_query = candidate
+
+        system_prompt = (
+            f"{build_grounded_system_prompt(agent.system_prompt, search.chunks, error=search.error)}"
+            f"\n\n{LEAD_CAPTURE_RULES}"
+        )
+        sources = [chunk.heading for chunk in search.chunks]
+
+        # LLM call kai second le sakta hai: tab tak DB transaction band rakho
+        await session.commit()
+
+        lead_status = None
+        try:
+            result = await llm.generate(system_prompt, history, tools=[SAVE_LEAD_TOOL])
+            llm_ms = result.latency_ms
+
+            if result.tool_calls:
+                # The LLM proposes; the consent gate in save_lead_from_tool decides.
+                tool_messages = []
+                for call in result.tool_calls:
+                    if call.name == "save_lead":
+                        outcome = await save_lead_from_tool(
+                            session,
+                            conversation.organization_id,
+                            conversation.id,
+                            history,
+                            call.arguments,
+                        )
+                        lead_status = outcome["status"]
+                    else:
+                        outcome = {"status": "rejected", "reason": "Unknown tool."}
+                    tool_messages.append(
+                        {"role": "tool", "tool_call_id": call.id, "content": json.dumps(outcome)}
+                    )
+                await session.commit()
+
+                follow_up = [
+                    *history,
+                    {
+                        "role": "assistant",
+                        "content": result.text or None,
+                        "tool_calls": [call.to_message_part() for call in result.tool_calls],
+                    },
+                    *tool_messages,
+                ]
+                result = await llm.generate(
+                    system_prompt, follow_up, tools=[SAVE_LEAD_TOOL], tool_choice="none"
+                )
+                llm_ms += result.latency_ms
+        except LLMError:
+            logger.exception("LLM call failed for conversation %s", conversation.id)
+            _record_turn(conversation, ok=False, error_type="LLMError",
+                         n_sources=len(sources), rag_ms=search.elapsed_ms)
+            raise HTTPException(
+                status_code=503, detail="AI service temporarily unavailable"
+            )
+
+        latency = {"llm": llm_ms, "rag": search.elapsed_ms, "rag_sources": sources}
+        if rewritten_query:
+            latency["rag_rewritten_query"] = rewritten_query
+        if search.error:
+            latency["rag_error"] = True
+        if lead_status:
+            latency["lead"] = lead_status
+
+        session.add(
+            Message(
+                organization_id=conversation.organization_id,
+                conversation_id=conversation.id,
+                role="assistant",
+                content=result.text,
+                latency_ms=latency,
+            )
+        )
+        await session.commit()
+
+        _record_turn(
+            conversation, ok=True, llm_ms=llm_ms, rag_ms=search.elapsed_ms, n_sources=len(sources),
+            lead_status=lead_status, reply_text=result.text,
+        )
+        turn.set_outputs(
+            reply_chars=len(result.text or ""),
+            n_sources=len(sources),
+            rewritten=bool(rewritten_query),
+            lead_status=lead_status,
+            llm_ms=llm_ms,
+            rag_ms=search.elapsed_ms,
+        )
+        return ChatReply(
             conversation_id=conversation.id,
-            role="assistant",
-            content=result.text,
-            latency_ms=latency,
+            reply=result.text,
+            llm_latency_ms=llm_ms,
+            sources=sources,
+            lead_status=lead_status,
         )
-    )
-    await session.commit()
-
-    return ChatReply(
-        conversation_id=conversation.id,
-        reply=result.text,
-        llm_latency_ms=llm_ms,
-        sources=sources,
-        lead_status=lead_status,
-    )

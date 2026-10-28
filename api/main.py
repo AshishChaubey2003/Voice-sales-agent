@@ -8,7 +8,10 @@ from fastapi.responses import JSONResponse
 from api.chat import router as chat_router
 from api.config import get_settings
 from api.db import build_engine, build_session_factory, database_ok
+from api.eval_routes import page_router as eval_page_router
+from api.eval_routes import router as eval_router
 from api.llm import GroqLLM
+from api.voice_tokens import router as voice_tokens_router
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Voice Sales Agent API", lifespan=lifespan)
 app.include_router(chat_router)
+app.include_router(eval_router)
+app.include_router(eval_page_router)
+app.include_router(voice_tokens_router)
 
 
 @app.get("/healthz")

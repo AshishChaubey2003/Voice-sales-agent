@@ -8,7 +8,7 @@ from sqlalchemy import select, text
 
 from api.chunking import split_markdown
 from api.db import build_engine, build_session_factory
-from api.embeddings import embed_passages, to_pgvector
+from api.embeddings import check_embedding_dimension, embed_passages, to_pgvector
 from api.models import KnowledgeDocument, Organization
 
 INSERT_CHUNK = text(
@@ -33,6 +33,11 @@ async def ingest(folder: Path, org_slug: str) -> None:
     files = sorted(folder.glob("*.md"))
     if not files:
         raise SystemExit(f"No .md files found in {folder}")
+
+    # DB-04: fail fast and clearly if EMBEDDING_MODEL no longer matches the fixed
+    # pgvector column dimension, rather than letting the mismatch surface as an opaque
+    # database error partway through inserting chunks.
+    check_embedding_dimension()
 
     engine = build_engine()
     session_factory = build_session_factory(engine)

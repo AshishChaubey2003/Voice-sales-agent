@@ -21,3 +21,5 @@ Thumbs.db
 
 .models/
 *.log
+# Evaluation run output (the dataset and baselines are tracked)
+evals/results/

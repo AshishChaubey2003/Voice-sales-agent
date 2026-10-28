@@ -4,6 +4,8 @@ from typing import Any, Protocol
 
 from groq import AsyncGroq
 
+from api.tracing import llm_inputs, llm_outputs, traced
+
 
 @dataclass
 class ToolCall:
@@ -24,6 +26,7 @@ class LLMReply:
     text: str
     latency_ms: int
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: dict[str, int | None] | None = None  # provider token counts when reported
 
 
 class LLMError(Exception):
@@ -56,6 +59,7 @@ class GroqLLM:
         self._max_output_tokens = max_output_tokens
         self._reasoning_effort = reasoning_effort
 
+    @traced("llm_call", "llm", process_inputs=llm_inputs, process_outputs=llm_outputs)
     async def generate(
         self,
         system_prompt: str,
@@ -100,7 +104,17 @@ class GroqLLM:
         ]
         if not text and not tool_calls:
             raise LLMError(f"empty_response finish_reason={choice.finish_reason}")
-        return LLMReply(text=text, latency_ms=latency_ms, tool_calls=tool_calls)
+        usage = getattr(response, "usage", None)
+        counts = (
+            {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
+            }
+            if usage is not None
+            else None
+        )
+        return LLMReply(text=text, latency_ms=latency_ms, tool_calls=tool_calls, usage=counts)
 
     async def close(self) -> None:
         await self._client.close()

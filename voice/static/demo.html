@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice client demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; background: #fff; }
+    textarea { width: 100%; height: 6rem; font-family: monospace; }
+    button { margin-right: .5rem; padding: .4rem .9rem; }
+    #status { margin-top: 1rem; font-weight: 600; }
+    .note { color: #555; font-size: .9rem; }
+    @media (prefers-color-scheme: dark) {
+      body { color: #eee; background: #111; }
+      .note { color: #aaa; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Voice client demo</h1>
+  <p class="note">
+    Local testing only, served outside production. In a real site the token comes from
+    your own backend (it calls <code>POST /v1/voice/tokens</code> with the organization key).
+    Paste a short-lived token below to test the flow. Never paste an organization API key here.
+  </p>
+
+  <label for="token">Voice token</label>
+  <textarea id="token" spellcheck="false" autocomplete="off"></textarea>
+
+  <p>
+    <button id="connect" type="button">Connect</button>
+    <button id="disconnect" type="button" disabled>Disconnect</button>
+  </p>
+
+  <div id="status" data-state="idle" role="status" aria-live="polite">Idle</div>
+  <audio id="bot-audio" autoplay></audio>
+
+  <script type="module">
+    import { startVoiceSession, VoiceAuthError } from "./voice-client.js";
+
+    const tokenInput = document.getElementById("token");
+    const connectButton = document.getElementById("connect");
+    const disconnectButton = document.getElementById("disconnect");
+    const statusEl = document.getElementById("status");
+    const botAudio = document.getElementById("bot-audio");
+    let activeSession = null;
+
+    function setStatus(state, text) {
+      statusEl.dataset.state = state;
+      statusEl.textContent = text;
+    }
+
+    connectButton.addEventListener("click", async () => {
+      connectButton.disabled = true;
+      setStatus("connecting", "Connecting...");
+      try {
+        const microphone = await navigator.mediaDevices.getUserMedia({ audio: true });
+        activeSession = await startVoiceSession({
+          baseUrl: location.origin,
+          getToken: async () => tokenInput.value,
+          microphone,
+          onTrack: (event) => {
+            botAudio.srcObject = event.streams[0];
+          },
+        });
+        activeSession.pc.addEventListener("connectionstatechange", () => {
+          if (activeSession) setStatus("signalling-complete", `Signalling complete. Connection: ${activeSession.pc.connectionState}`);
+        });
+        setStatus("signalling-complete", "Signalling complete. Connection: " + activeSession.pc.connectionState);
+        disconnectButton.disabled = false;
+      } catch (error) {
+        connectButton.disabled = false;
+        const message = error instanceof VoiceAuthError
+          ? "Token refused: " + error.message
+          : "Could not connect: " + error.message;
+        setStatus("error", message);
+      }
+    });
+
+    disconnectButton.addEventListener("click", () => {
+      if (activeSession) activeSession.close();
+      activeSession = null;
+      botAudio.srcObject = null;
+      disconnectButton.disabled = true;
+      connectButton.disabled = false;
+      setStatus("idle", "Disconnected");
+    });
+  </script>
+</body>
+</html>

@@ -33,3 +33,6 @@ Thumbs.db
 
 # Docs that do not belong in the runtime image
 day1-audit-report.md
+
+# Local evaluation output
+evals/results/

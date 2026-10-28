@@ -15,6 +15,7 @@ from api.knowledge import (
     search_knowledge,
 )
 from api.llm import LLMClient, LLMError
+from api.tracing import turn_inputs, turn_trace
 
 KNOWLEDGE_MARKER = "Knowledge base for the visitor's latest message"
 
@@ -67,6 +68,18 @@ def latest_user_text(messages) -> str | None:
     return turns[-1]["content"]
 
 
+def bounded_dialogue(messages, limit: int) -> list[dict[str, str]]:
+    """The most recent `limit` visitor/assistant text turns, as plain text messages.
+
+    Voice used to keep the whole call in the LLM context, so every turn cost more tokens than
+    the one before. The text path already bounds history to CHAT_HISTORY_LIMIT in SQL. This
+    applies the same bound here. Tool-call and tool-result messages are dropped, so an
+    orphaned tool call is never sent. The save_lead consent gate only reads the last two turns,
+    and those are always kept.
+    """
+    return conversation_turns(messages)[-max(int(limit), 1):]
+
+
 def with_knowledge(messages, knowledge_text: str) -> list:
     cleaned = [message for message in messages if not is_knowledge_message(message)]
     return cleaned + [
@@ -93,6 +106,7 @@ class KnowledgeInjector(FrameProcessor):
         settings,
         rewriter: LLMClient | None,
         on_retrieval: RetrievalCallback,
+        conversation_id: uuid.UUID | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -101,6 +115,7 @@ class KnowledgeInjector(FrameProcessor):
         self._settings = settings
         self._rewriter = rewriter
         self._on_retrieval = on_retrieval
+        self._conversation_id = conversation_id
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -123,25 +138,46 @@ class KnowledgeInjector(FrameProcessor):
             return
 
         start = time.perf_counter()
-        search = await self._search(query)
-        rewritten_query = None
+        # Only the retrieval step is a traced turn: the Pipecat STT/LLM/TTS services
+        # are not instrumented, so this parent never contains the model call.
+        with turn_trace(
+            "voice_retrieval_turn",
+            session_id=self._conversation_id or "unknown",
+            channel="voice",
+            organization_id=self._organization_id,
+            inputs=turn_inputs(query),
+        ) as turn:
+            search = await self._search(query)
+            rewritten_query = None
 
-        if not search.chunks and self._rewriter and len(conversation_turns(messages)) > 1:
-            candidate = await self._rewrite(messages)
-            if candidate and candidate.lower() != query.lower():
-                retry = await self._search(candidate)
-                if retry.chunks:
-                    search = retry
-                    rewritten_query = candidate
+            if (
+                not search.chunks
+                and not search.error
+                and self._rewriter
+                and len(conversation_turns(messages)) > 1
+            ):
+                candidate = await self._rewrite(messages)
+                if candidate and candidate.lower() != query.lower():
+                    retry = await self._search(candidate)
+                    if retry.chunks:
+                        search = retry
+                        rewritten_query = candidate
+            turn.set_outputs(n_sources=len(search.chunks), rewritten=bool(rewritten_query))
 
+        limit = getattr(self._settings, "chat_history_limit", 10)
         set_context_messages(
-            context, with_knowledge(messages, format_knowledge_context(search.chunks))
+            context,
+            with_knowledge(
+                bounded_dialogue(messages, limit),
+                format_knowledge_context(search.chunks, error=search.error),
+            ),
         )
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         sources = [chunk.heading for chunk in search.chunks]
         logger.info(
-            f"Knowledge search: {elapsed_ms} ms, sources={sources}, rewritten={rewritten_query!r}"
+            f"Knowledge search: {elapsed_ms} ms, sources={sources}, "
+            f"rewritten={rewritten_query is not None}, error={search.error}"
         )
         self._on_retrieval(elapsed_ms, sources, rewritten_query)
 
@@ -157,7 +193,9 @@ class KnowledgeInjector(FrameProcessor):
                 )
         except Exception:
             logger.exception("Knowledge search failed")
-            return SearchResult(chunks=[], elapsed_ms=0)
+            # error=True: an infrastructure failure, never evidence the knowledge base
+            # lacks the answer - see api/knowledge.py::SearchResult.
+            return SearchResult(chunks=[], elapsed_ms=0, error=True)
 
     async def _rewrite(self, messages) -> str:
         try:

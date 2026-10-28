@@ -117,7 +117,7 @@ LLM and TTS stay fast even at p95. The slow tail comes mainly from **fragmented 
 | "Can reminders be sent on WhatsApp?" | Features > Follow-up reminders (correct) | 0.259 |
 | "Is NimbusCRM HIPAA compliant?" (not in the documents) | an unrelated section | 0.343 |
 
-A gate of **0.30** keeps the correct answers and rejects the unanswerable question. It was tuned on only a few questions, so an automated evaluation set is next on the roadmap.
+A gate of **0.30** keeps the correct answers and rejects the unanswerable question. It was tuned on only a few questions. An evaluation pipeline now exists (see [Evaluation](#evaluation)), but no baseline run has been recorded yet, so the gate has not been re-tuned against it.
 
 ### Manual behaviour checks
 
@@ -149,7 +149,7 @@ A gate of **0.30** keeps the correct answers and rejects the unanswerable questi
 ## Known limitations
 
 - **No dashboard or leads API.** There is no authentication yet, so leads are read with a local script instead of an HTTP endpoint.
-- **Guardrails are prompt plus one code gate.** They held in manual tests, but there is no automated evaluation set yet.
+- **Guardrails are prompt plus one code gate.** They held in manual tests. An automated evaluation pipeline exists, but its 75-case dataset is unreviewed and has not been run against the live system yet.
 - **Distance gate tuned on a small sample.** Some valid questions may get "I don't have that information".
 - **Sources list shows retrieved chunks,** not necessarily the ones the LLM used.
 - **Interrupting during a knowledge search** can still produce a reply to the previous question.
@@ -252,7 +252,7 @@ docker-compose.yml
 - [x] Voice transcripts and per-turn latency tracking
 - [x] Knowledge base (RAG) with hybrid search, distance gate and query rewrite
 - [x] Lead capture with tool calling and a code-side consent gate
-- [ ] Automated evaluation set for retrieval, answers and lead capture
+- [~] Automated evaluation for retrieval, answers and lead capture: pipeline, 75 unreviewed cases and dashboard are in place; needs human review of the cases and a first real baseline run
 - [ ] Embeddable website widget
 - [ ] Better turn detection — a dedicated end-of-turn model and merging fragmented visitor turns (today it is Silero VAD only)
 - [ ] LangGraph agent orchestration
@@ -266,3 +266,20 @@ docker-compose.yml
 
 **Ashish Kumar Chaubey**, Python backend and GenAI developer
 GitHub: [@AshishChaubey2003](https://github.com/AshishChaubey2003)
+
+## Evaluation
+
+A reproducible evaluation pipeline lives in `evals/` (plan, metric definitions and limits: [docs/EVALUATION_PLAN.md](docs/EVALUATION_PLAN.md)).
+
+```powershell
+# Plan only, no services, no cost
+.\.venv313\Scripts\python.exe -m evals.run --dry-run
+# Retrieval metrics (Recall@K, Precision@K, MRR); needs Postgres + ingested knowledge, no LLM calls
+.\.venv313\Scripts\python.exe -m evals.run --mode retrieval --org nimbus-crm-demo
+# Full pipeline: paid LLM calls, capped by --max-llm-calls
+.\.venv313\Scripts\python.exe -m evals.run --mode full --allow-llm --dry-run
+```
+
+Results are written to `evals/results/<run_id>/` (git-ignored). The dashboard is at `/dashboard/evals`; paste an organization API key and it reads that organization's runs through `/v1/evals/*`. Optional LangSmith tracing and experiments are off by default: [docs/LANGSMITH.md](docs/LANGSMITH.md).
+
+The golden dataset is 75 cases and none are human-reviewed yet, so treat any number as indicative until they are.

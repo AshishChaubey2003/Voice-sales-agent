@@ -26,6 +26,8 @@ def settings_from_env(monkeypatch):
         get_settings.cache_clear()
         # Ignore the developer's own .env so the test result cannot depend on it.
         monkeypatch.setitem(Settings.model_config, "env_file", None)
+        # The defaults under test assume REDIS_ENABLED is unset in the process environment.
+        monkeypatch.delenv("REDIS_ENABLED", raising=False)
         for key, value in {**LOCAL_DB, **LLM, "redis_password": "p", **env}.items():
             monkeypatch.setenv(key.upper(), str(value))
         return get_settings()
@@ -34,7 +36,10 @@ def settings_from_env(monkeypatch):
     get_settings.cache_clear()
 
 
-def test_valid_local_settings_are_accepted():
+def test_valid_local_settings_are_accepted(monkeypatch):
+    # build() still reads the process environment, so clear the vars this test asserts defaults for.
+    monkeypatch.delenv("REDIS_ENABLED", raising=False)
+    monkeypatch.delenv("TTS_PROVIDER", raising=False)
     settings = build()
     assert settings.tts_provider == "groq"
     assert settings.redis_enabled is True
@@ -49,7 +54,10 @@ def test_voice_call_guard_defaults_and_overrides():
     assert tuned.voice_max_concurrent_calls == 2
 
 
-def test_database_parts_or_database_url_is_required():
+def test_database_parts_or_database_url_is_required(monkeypatch):
+    # Process env vars override the Settings defaults, so clear the ones this test relies on.
+    for name in ("DATABASE_URL", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"):
+        monkeypatch.delenv(name, raising=False)
     with pytest.raises(ValidationError) as error:
         Settings(_env_file=None, redis_password="p", **LLM)
     assert "DATABASE_URL" in str(error.value)
@@ -86,7 +94,9 @@ def test_deepgram_provider_requires_its_api_key():
     assert build(tts_provider="deepgram", deepgram_api_key="k").tts_provider == "deepgram"
 
 
-def test_redis_password_is_required_only_when_redis_is_enabled():
+def test_redis_password_is_required_only_when_redis_is_enabled(monkeypatch):
+    for name in ("DATABASE_URL", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB", "REDIS_ENABLED", "REDIS_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **LOCAL_DB, **LLM)
 
