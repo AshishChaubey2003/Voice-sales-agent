@@ -29,7 +29,11 @@ Demo video: *coming soon*
 | **Transcripts and latency saved** | Every voice and text message is stored with per-turn timings, knowledge search time and sources |
 | **Swappable TTS provider** | `TTS_PROVIDER=groq` or `deepgram` in `.env`, no code change |
 | **Multi-tenant-ready schema** | Every table carries `organization_id`; composite foreign keys stop cross-company links, and knowledge search is filtered by company in SQL |
-| **Tests** | 48 pytest tests; the LLM, the search and the tool calls are replaced with fakes, so tests use no API quota |
+| **Tests** | pytest suite: 844 passed, 4 skipped (cloud, Python 3.13); the LLM, the search and the tool calls are replaced with fakes, so tests use no API quota |
+| **LangGraph orchestration** | StateGraph with 8 nodes: intent detection, knowledge retrieval, response generation, consent gate, lead capture, handoff, follow-up. Conditional routing, error handling, legacy fallback via `CHAT_ORCHESTRATOR=legacy` |
+| **MCP integration** | 3 tools over Streamable HTTP at `/mcp/`: `search_knowledge`, `get_sales_availability`, `create_lead` (consent-gated). Same auth and consent gates as REST API |
+| **Human handoff** | Sales rep availability, live-chat handoff (pending → assigned → resolved), atomic claim, transcript + reply, email notification (SMTP), sales dashboard at `/dashboard/sales` |
+| **Evaluation dashboard** | Live turn-level evaluation at `/dashboard/evals`: quality scores, latency percentiles, RAG metrics, nonce-CSP |
 
 ---
 
@@ -79,7 +83,7 @@ flowchart LR
 
 | Layer | Choice |
 |---|---|
-| Backend API | Python 3.12, FastAPI, Pydantic v2 |
+| Backend API | Python 3.13, FastAPI, Pydantic v2 |
 | Voice pipeline | Pipecat (SmallWebRTC transport, Silero VAD for turn detection, function calling) |
 | Speech-to-text | Groq Whisper |
 | LLM | Groq `openai/gpt-oss-20b` with tool calling |
@@ -148,7 +152,7 @@ A gate of **0.30** keeps the correct answers and rejects the unanswerable questi
 
 ## Known limitations
 
-- **No dashboard or leads API.** There is no authentication yet, so leads are read with a local script instead of an HTTP endpoint.
+- **Leads are created through chat or MCP,** read with `python -m scripts.list_leads`. The evaluation dashboard shows evaluation runs; the sales dashboard shows handoff status and rep availability.
 - **Guardrails are prompt plus one code gate.** They held in manual tests. An automated evaluation pipeline exists, but its 75-case dataset is unreviewed and has not been run against the live system yet.
 - **Distance gate tuned on a small sample.** Some valid questions may get "I don't have that information".
 - **Sources list shows retrieved chunks,** not necessarily the ones the LLM used.
@@ -163,7 +167,7 @@ A gate of **0.30** keeps the correct answers and rejects the unanswerable questi
 
 ### Prerequisites
 
-- Python 3.12
+- Python 3.13 (used by the Docker images, CI and the last local test run)
 - Docker Desktop
 - A [Groq](https://console.groq.com) API key
 - A [Deepgram](https://console.deepgram.com) API key
@@ -172,13 +176,27 @@ A gate of **0.30** keeps the correct answers and rejects the unanswerable questi
 ### Setup
 
 ```bash
-git clone https://github.com/AshishChaubey2003/ai-voice-sales-agent.git
-cd ai-voice-sales-agent
+git clone https://github.com/AshishChaubey2003/Voice-sales-agent.git
+cd Voice-sales-agent
 
 python -m venv .venv
-# Windows:        .venv\Scripts\activate
-# macOS / Linux:  source .venv/bin/activate
+```
 
+Activate the virtual environment:
+
+```powershell
+# Windows (PowerShell)
+.\.venv\Scripts\Activate.ps1
+```
+
+```bash
+# macOS / Linux
+source .venv/bin/activate
+```
+
+Then install the dependencies and create your local `.env`:
+
+```bash
 pip install -r requirements.txt
 cp .env.example .env    # then fill in real passwords and API keys
 ```
@@ -216,7 +234,14 @@ Open http://127.0.0.1:8001/docs. Replies include the knowledge `sources` used an
 python -m voice.bot -t webrtc
 ```
 
-Open http://localhost:7860, keep the transport on **SmallWebRTC**, click **Connect**, and ask about NimbusCRM's plans or ask to be contacted by sales.
+Voice calls require a short-lived signed token, so the runner's built-in `/client` page (which cannot send the token) is refused by design.
+
+1. Set `VOICE_TOKEN_SECRET` (32 or more random characters, the same value for the text API and the voice bot) in your local `.env`.
+2. Create an organization API key with `python -m scripts.create_api_key --org <organization-slug>`.
+3. With the text API running, request a token: `POST /v1/voice/tokens` with the header `Authorization: Bearer <organization API key>`. Keep the API key and the signing secret on your server; only the short-lived token goes to the browser.
+4. Outside production the runner serves a local test page at http://localhost:7860/voice-client/demo.html. Paste the token (never the API key), connect, and ask about NimbusCRM's plans or ask to be contacted by sales.
+
+Details and the verified scope of this flow: [docs/voice-token-client.md](docs/voice-token-client.md) and section 5.3 of [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ### Useful scripts
 
@@ -237,7 +262,7 @@ voice/          Pipecat voice bot, knowledge injector, lead tool, turn recorder,
 knowledge/      Demo company documents (markdown)
 scripts/        Demo seeding, knowledge ingestion, search, leads and latency report
 migrations/     Alembic database migrations
-tests/          pytest suite
+tests/          pytest suite (844+ tests)
 docker-compose.yml
 ```
 
@@ -252,20 +277,20 @@ docker-compose.yml
 - [x] Voice transcripts and per-turn latency tracking
 - [x] Knowledge base (RAG) with hybrid search, distance gate and query rewrite
 - [x] Lead capture with tool calling and a code-side consent gate
-- [~] Automated evaluation for retrieval, answers and lead capture: pipeline, 75 unreviewed cases and dashboard are in place; needs human review of the cases and a first real baseline run
-- [ ] Embeddable website widget
+- [x] Automated evaluation: pipeline, 75 golden cases, 60 candidate cases, dashboard at `/dashboard/evals`; human review pending
+- [x] Embeddable website widget: `voice/static/demo.html` with voice token auth (no API key in browser)
 - [ ] Better turn detection — a dedicated end-of-turn model and merging fragmented visitor turns (today it is Silero VAD only)
-- [ ] LangGraph agent orchestration
+- [x] LangGraph agent orchestration: StateGraph with conditional routing, 20 tests
 - [ ] Calendar booking and CRM sync behind a permission model
-- [ ] Authentication, leads dashboard, rate limiting, PII handling
-- [ ] Observability and production deployment
+- [x] Authentication: organization API key for the text API, short-lived signed token for voice calls
+- [x] MCP integration: 3 tools (knowledge search, availability, consent-gated lead creation), 20 tests
+- [x] Human handoff: state machine, atomic claim, SMTP notification, sales dashboard, 19 tests
+- [ ] Rate limiting, PII handling
+- [x] CI/CD: GitHub Actions with lint, format, security, test jobs
+- [x] Docker: Compose with api + voice + postgres + redis services
+- [ ] Production deployment (blocked on provider credentials)
 
 ---
-
-## Author
-
-**Ashish Kumar Chaubey**, Python backend and GenAI developer
-GitHub: [@AshishChaubey2003](https://github.com/AshishChaubey2003)
 
 ## Evaluation
 
@@ -283,3 +308,10 @@ A reproducible evaluation pipeline lives in `evals/` (plan, metric definitions a
 Results are written to `evals/results/<run_id>/` (git-ignored). The dashboard is at `/dashboard/evals`; paste an organization API key and it reads that organization's runs through `/v1/evals/*`. Optional LangSmith tracing and experiments are off by default: [docs/LANGSMITH.md](docs/LANGSMITH.md).
 
 The golden dataset is 75 cases and none are human-reviewed yet, so treat any number as indicative until they are.
+
+---
+
+## Author
+
+**Ashish Kumar Chaubey**, Python backend and GenAI developer
+GitHub: [@AshishChaubey2003](https://github.com/AshishChaubey2003)
