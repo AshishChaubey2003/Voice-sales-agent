@@ -25,3 +25,6 @@ class ChatReply(BaseModel):
     llm_latency_ms: int
     sources: list[str] = Field(default_factory=list)
     lead_status: str | None = None
+    # Set when a human is involved: "pending" (asked for, nobody has taken it yet), "assigned"
+    # (a rep owns the chat and the AI stays silent) or None.
+    handoff_status: str | None = None

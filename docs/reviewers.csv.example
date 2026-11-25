@@ -1,0 +1,30 @@
+# EXAMPLE ONLY - not a real registry, not read by any tool, not inside evals/review/.
+# "asha", "ravi" and "kiran" below are PLACEHOLDER NAMES, not real people. Do not copy them into
+# evals/review/reviewers.csv as-is: replace every value with a real reviewer's actual information.
+#
+# Copy the header line and the rows below it (never this comment block) into a NEW file at
+# evals/review/reviewers.csv, then replace every placeholder with real information. That file does
+# not exist yet, and nothing in this repository creates it for you - a human writes it by hand.
+#
+# Column reference (full rules: docs/EVAL_REVIEW_GUIDE.md section 17):
+#   reviewer_id   unique, 2-40 chars: lowercase letters, digits, '.', '_', '-' only. The id YOU give
+#                 this person; they will use it in their own sheet file names.
+#   display_name  the person's real name as people know them. Compared EXACTLY (case/spacing-insensitive
+#                 only) against every other display_name - never fuzzy. Two people must not share one.
+#   role          exactly "reviewer" (fills a sheet) or "resolver" (settles disputes). A resolver MUST
+#                 NOT also be a reviewer and must list no sheets.
+#   sheets        for a reviewer: the sheet file name(s) they will submit, WITHOUT "sheet_" and ".csv",
+#                 separated by "; " if more than one (e.g. "asha-golden; asha-candidates"). This is
+#                 normally filled in AFTER you have told the reviewer their reviewer_id and they have
+#                 agreed on the exact file names they will use - fill in the real names, not a guess.
+#                 For a resolver: leave blank.
+#   attested_by   who is vouching, in writing, that this reviewer_id is a real, distinct person -
+#                 typically the review lead's own name. This is NOT a cryptographic identity check: it
+#                 is only as reliable as that person's word. Never leave blank, and never fill this in
+#                 for someone who has not actually been vouched for.
+#
+# Minimum to start a review: at least 2 people with role "reviewer" and 1 person with role "resolver".
+reviewer_id,display_name,role,sheets,attested_by
+asha,EXAMPLE-REPLACE-WITH-REAL-NAME,reviewer,asha-golden; asha-candidates,EXAMPLE-REPLACE-WITH-REAL-ATTESTER
+ravi,EXAMPLE-REPLACE-WITH-REAL-NAME,reviewer,ravi-golden; ravi-candidates,EXAMPLE-REPLACE-WITH-REAL-ATTESTER
+kiran,EXAMPLE-REPLACE-WITH-REAL-NAME,resolver,,EXAMPLE-REPLACE-WITH-REAL-ATTESTER

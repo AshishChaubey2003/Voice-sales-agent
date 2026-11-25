@@ -1,5 +1,10 @@
+import uuid
+
+import pytest
+
 from voice.rag import (
     KNOWLEDGE_MARKER,
+    KnowledgeInjector,
     is_knowledge_message,
     is_tool_result,
     latest_user_text,
@@ -50,3 +55,39 @@ def test_tool_results_do_not_trigger_a_new_search():
 
     assert is_tool_result(messages)
     assert not is_tool_result([{"role": "user", "content": "Hi"}])
+
+
+class _FakeSettings:
+    rag_top_k = 4
+    rag_max_distance = 0.3
+
+
+def _make_injector(session_factory):
+    return KnowledgeInjector(
+        session_factory=session_factory,
+        organization_id=uuid.uuid4(),
+        settings=_FakeSettings(),
+        rewriter=None,
+        on_retrieval=lambda *args: None,
+    )
+
+
+@pytest.mark.anyio
+async def test_voice_search_marks_infrastructure_failures_distinctly_from_empty_results():
+    """RAG-02/VOICE-02 mirror of the chat-path fix: the voice pipeline's own retrieval
+    wrapper must flag an exception as error=True, not silently coerce it into the same
+    SearchResult shape as 'nothing relevant found'."""
+
+    def raising_session_factory():
+        raise RuntimeError("pgvector connection lost")
+
+    injector = _make_injector(raising_session_factory)
+    result = await injector._search("How much is the Pro plan?")
+
+    assert result.chunks == []
+    assert result.error is True
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"

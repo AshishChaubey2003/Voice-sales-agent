@@ -1,0 +1,23 @@
+# CI-only version constraints. Use with:  pip install -r requirements.txt -c constraints-ci.txt
+#
+# They pin the voice stack to the versions the test suite was validated against:
+#   - Windows .venv313:   pipecat-ai 1.12.0, pipecat-ai-prebuilt 1.3.0, aiortc 1.15.0
+#   - Linux container:    the same three versions
+# requirements.txt allows newer releases (pipecat-ai>=1.8). On 2026-10-28 an unconstrained
+# install resolved pipecat-ai 1.14.0, which has NOT been tested with this project.
+#
+# A constraints file installs nothing by itself, and it does not change requirements.txt or
+# requirements.lock.txt. Raise these pins deliberately, after re-running the full suite
+# (including tests/test_voice_runner_contract.py and the browser check) on the new versions.
+pipecat-ai==1.12.0
+pipecat-ai-prebuilt==1.3.0
+aiortc==1.15.0
+
+langgraph==1.2.24
+mcp==2.3.0
+
+# Lint tooling, pinned for the same reason. `pip install ruff` is unpinned by default and
+# resolved ruff 0.17.6 on 2026-11-25; its default rule set is much wider than the classic
+# E/F pair, which failed CI with 280 findings on code that had never been linted. The rules
+# this project actually enforces are declared in ruff.toml, not left to the ruff default.
+ruff==0.17.6

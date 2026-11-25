@@ -6,6 +6,8 @@ from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
     Computed,
     DateTime,
     ForeignKey,
@@ -15,6 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
@@ -36,6 +39,12 @@ class Organization(TimestampMixin, Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(200))
     slug: Mapped[str] = mapped_column(String(100), unique=True)
+    # SHA-256 hex digest of the org's API key. Nullable so existing rows remain
+    # valid after migration; an org with no hash simply cannot authenticate.
+    # The raw key is never stored here.
+    api_key_hash: Mapped[str | None] = mapped_column(
+        String(64), unique=True, nullable=True
+    )
 
 
 class Agent(TimestampMixin, Base):
@@ -171,4 +180,136 @@ class Lead(TimestampMixin, Base):
         ),
         UniqueConstraint("organization_id", "conversation_id"),
         Index("ix_leads_org_created", "organization_id", "created_at"),
-    )       
+    )
+
+
+TURN_EVALUATION_STATUSES = ("passed", "failed", "ungraded", "error", "skipped")
+
+
+class TurnEvaluation(TimestampMixin, Base):
+    """One evaluation of one assistant message by one evaluator version (see evals/live.py).
+
+    (message_id, evaluator_version) is unique, so re-running the evaluator can never create a duplicate.
+    A different evaluator version adds a new row and keeps the old one. `pending` is not stored: a turn
+    with no row yet is pending. There is no trace id column on purpose: neither channel stores a LangSmith
+    run id with the message today, so there is nothing genuine to link.
+    """
+
+    __tablename__ = "turn_evaluations"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    conversation_id: Mapped[uuid.UUID]
+    message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+    user_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL")
+    )
+    evaluator_version: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(20))
+    correctness: Mapped[str | None] = mapped_column(String(20))
+    correctness_provisional: Mapped[bool] = mapped_column(Boolean, server_default="true")
+    reference_quality: Mapped[str] = mapped_column(String(20), server_default="none")
+    reference_case_id: Mapped[str | None] = mapped_column(String(100))
+    dataset_sha256: Mapped[str | None] = mapped_column(String(64))
+    ungraded_reason: Mapped[str | None] = mapped_column(Text)
+    result: Mapped[dict] = mapped_column(JSONB)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["conversation_id", "organization_id"],
+            ["conversations.id", "conversations.organization_id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("message_id", "evaluator_version", name="uq_turn_evaluations_message_version"),
+        CheckConstraint(
+            "status IN ('passed', 'failed', 'ungraded', 'error', 'skipped')", name="status_valid"
+        ),
+        CheckConstraint(
+            "correctness IS NULL OR correctness IN ('correct', 'partial', 'incorrect')",
+            name="correctness_valid",
+        ),
+        Index("ix_turn_evaluations_org_created", "organization_id", "created_at"),
+        Index("ix_turn_evaluations_org_status", "organization_id", "status"),
+        Index("ix_turn_evaluations_conversation", "conversation_id"),
+    )
+
+
+SALES_REP_STATUSES = ("available", "busy", "offline")
+HANDOFF_STATUSES = ("pending", "assigned", "resolved", "cancelled")
+HANDOFF_OPEN_STATUSES = ("pending", "assigned")
+NOTIFICATION_STATUSES = ("not_configured", "sent", "failed")
+
+
+class SalesRep(TimestampMixin, Base):
+    """A human on the organization's sales team who can take over a live chat."""
+
+    __tablename__ = "sales_reps"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    name: Mapped[str] = mapped_column(String(200))
+    email: Mapped[str] = mapped_column(String(320))
+    status: Mapped[str] = mapped_column(String(20), server_default="offline", default="offline")
+    status_changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("id", "organization_id"),
+        UniqueConstraint("organization_id", "email", name="uq_sales_reps_org_email"),
+        CheckConstraint("status IN ('available', 'busy', 'offline')", name="status_valid"),
+        Index("ix_sales_reps_org_status", "organization_id", "status"),
+    )
+
+
+class HandoffRequest(TimestampMixin, Base):
+    """A visitor asked for a human. At most one open request per conversation (partial unique index)."""
+
+    __tablename__ = "handoff_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    conversation_id: Mapped[uuid.UUID]
+    status: Mapped[str] = mapped_column(String(20), server_default="pending", default="pending")
+    reason: Mapped[str | None] = mapped_column(String(300))
+    # Short transcript snippet handed to the rep; the full conversation is read through the API.
+    context_summary: Mapped[str] = mapped_column(Text, server_default="", default="")
+    assigned_rep_id: Mapped[uuid.UUID | None]
+    assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notification_status: Mapped[str] = mapped_column(
+        String(20), server_default="not_configured", default="not_configured"
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["conversation_id", "organization_id"],
+            ["conversations.id", "conversations.organization_id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["assigned_rep_id", "organization_id"],
+            ["sales_reps.id", "sales_reps.organization_id"],
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'assigned', 'resolved', 'cancelled')", name="status_valid"
+        ),
+        CheckConstraint(
+            "notification_status IN ('not_configured', 'sent', 'failed')",
+            name="notification_status_valid",
+        ),
+        Index(
+            "uq_handoff_one_open_per_conversation",
+            "conversation_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'assigned')"),
+        ),
+        Index("ix_handoff_requests_org_status", "organization_id", "status", "created_at"),
+    )

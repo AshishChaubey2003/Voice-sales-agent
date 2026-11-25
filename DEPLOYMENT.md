@@ -55,6 +55,13 @@ A libpq-style `?sslmode=require` is passed straight through by SQLAlchemy's
 asyncpg dialect and fails at connect time. Verified against SQLAlchemy 2.1.5
 and asyncpg 0.32.0.
 
+**Production requires TLS.** With `APP_ENV=production`, configuration is refused
+unless `DB_SSL` is `require`, `verify-ca` or `verify-full`, or `DATABASE_URL`
+carries `ssl=require` (or one of those modes). `disable`, `allow` and `prefer`
+are refused, because they can fall back to plaintext. `require` encrypts the
+connection but does not verify the server certificate; `verify-full` also
+verifies it. Development is unaffected. The error names the fields, never the URL.
+
 Pool settings: `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_RECYCLE_SECONDS`.
 Keep them small on a serverless database — the API process and the voice bot
 process each build their own engine, so the real connection count is roughly
@@ -97,6 +104,19 @@ python -m scripts.seed_demo          # copy the agent_id into VOICE_AGENT_ID
 python -m scripts.ingest_knowledge   # downloads the embedding model on first run
 ```
 
+Organizations have **no API key** when they are created (including the demo
+organization from `seed_demo`), so the text chat API answers `401` until one is
+minted. Mint one in a real terminal (full behaviour in 6.10):
+
+```bash
+python -m scripts.create_api_key --org nimbus-crm-demo   # the slug seed_demo creates
+```
+
+The raw key is shown **once**, on screen, and only its SHA-256 hash is stored.
+Copy it straight into a password manager or your secret manager and deliver it
+to the client over a secure channel. Never commit it to Git, and never paste it
+into logs, chat, tickets or email.
+
 ---
 
 ## 3. Verification
@@ -107,7 +127,10 @@ Run these in order. Each one has an expected result.
 # 1. Tests. Use "python -m pytest", not bare "pytest": the repo has no
 #    conftest.py, so only the module form puts the project root on sys.path.
 python -m pytest -q
-#    expected: 67 passed
+#    last verified full run: 690 passed, 1 skipped, 2 warnings in 52.08 s, on the
+#    maintainer's local Windows machine with Python 3.13. The PostgreSQL environment
+#    used for that run was not recorded. The count grows as tests are added; it says
+#    nothing about any other environment.
 
 # 2. Configuration loads
 python -c "from api.config import get_settings; print(get_settings().tts_provider)"
@@ -247,12 +270,16 @@ serves its own HTTP on port 7860) are separate processes on separate ports.
 Hosts that expose a single port can run one of them, not both. Decide which
 one the public URL serves, or merge them, before deploying.
 
-### 5.3 Nothing is authenticated
+### 5.3 Voice access is private (token required)
 
-The runner's offer endpoint and its `/start` endpoint have no authentication,
-and its CORS policy allows every origin by default. A public URL therefore
-lets anyone start a voice session and spend your Groq, Deepgram and TURN
-allowance. At minimum set:
+Every voice route, including `/start`, `/api/offer`, the session proxy and the
+websocket endpoints, refuses a request before any session starts unless it
+carries `Authorization: Bearer <token>`. Your server gets the token from
+`POST /v1/voice/tokens` (text API, organization API key required) and passes it
+to the visitor's page. Tokens expire after `VOICE_TOKEN_TTL_SECS` (default 300).
+Without `VOICE_TOKEN_SECRET` the voice runner refuses every session, and in
+production it will not start. A public URL otherwise lets anyone spend your Groq,
+Deepgram and TURN allowance, so before publishing also set:
 
 ```bash
 PIPECAT_ALLOWED_ORIGINS=https://your-demo-host.example.com
@@ -314,8 +341,8 @@ check the provider's pricing page when you deploy.
 |---|---|
 | 5.1 ICE servers | **Configurable, not auto-fixed.** The bot now reads `PIPECAT_ICE_SERVERS`, validates it, and logs at startup whether a remote visitor can connect (warns loudly when it is unset or STUN-only). You still have to supply a STUN URL and a TURN relay. |
 | 5.2 Two processes, one port | **Decided:** two separate services. `Dockerfile` runs the voice bot (port 7860); `Dockerfile.api` runs the API (port 8001). A single-port host runs the voice bot; the API goes to a second service. |
-| 5.3 Auth / abuse | **Partly closed.** `VOICE_MAX_CALL_SECONDS` and `VOICE_MAX_CONCURRENT_CALLS` are enforced in the bot; `PIPECAT_ALLOWED_ORIGINS` is documented. There is still no user authentication — see 6.6. |
-| 5.4 Reproducible build | **Closed.** `requirements.lock.txt` is generated from the environment where the 67 tests passed, and both Dockerfiles install from it. |
+| 5.3 Auth / abuse | **Closed for voice.** Voice routes require a short-lived signed token from `POST /v1/voice/tokens`, and fail closed without `VOICE_TOKEN_SECRET`. `VOICE_MAX_CALL_SECONDS` and `VOICE_MAX_CONCURRENT_CALLS` are enforced in the bot; `PIPECAT_ALLOWED_ORIGINS` is documented. Leads are still not exposed over HTTP — see 6.6. The text API requires an organization API key (6.10). |
+| 5.4 Reproducible build | **Closed.** `requirements.lock.txt` is generated from the environment where the test suite passed, and both Dockerfiles install from it. |
 | 5.5 Model downloaded at runtime | **Closed for Docker.** Both Dockerfiles bake the model into the image at build time (`BAKE_EMBEDDING_MODEL`), so a cold start does not re-download it. |
 | 5.6 Memory | Unchanged; still measure the real peak on the target host. |
 
@@ -357,11 +384,22 @@ never usernames or credentials. If you see
 `PIPECAT_ICE_SERVERS is not set: the bot will gather host candidates only`,
 no remote visitor can connect yet.
 
-**Production fail-fast:** when `APP_ENV=production`, the bot refuses to start if
-`PIPECAT_ICE_SERVERS` has no STUN server (or is malformed) or if
-`PIPECAT_ALLOWED_ORIGINS` is unset — so it cannot come up "healthy" and then
-reject every visitor, or serve with wildcard CORS. In development (the default)
-these are warnings, not errors, so local work is unaffected.
+**Production fail-fast (two layers):**
+
+*Startup check (process exit):* `check_startup_config()` in `voice/bot.py` is
+called from `__main__` before the Pipecat runner begins accepting connections.
+When `APP_ENV=production`, it evaluates `PIPECAT_ICE_SERVERS` and
+`PIPECAT_ALLOWED_ORIGINS`; if either is missing or invalid, it logs the errors
+and raises `SystemExit` — the process exits with code 1 before a single call is
+handled, so it cannot come up "healthy" and silently reject every visitor.
+
+*Per-call check (defense-in-depth):* `run_bot()` repeats the same check at the
+start of each call.  In the normal case the startup check already caught any
+misconfiguration; this layer guards against environments where `__main__` is
+bypassed (a custom runner, a test harness, or a future deployment change).
+
+In development (the default `APP_ENV`) both checks are no-ops — local work is
+completely unaffected.
 
 Transport is **not** changed to Daily. The SmallWebRTC + TURN route is a
 configuration change and keeps the architecture as it is. If TURN proves hard
@@ -441,17 +479,25 @@ VOICE_MAX_CALL_SECONDS=300                             # caps the worst case per
 VOICE_MAX_CONCURRENT_CALLS=1                           # bounds how many pipelines run at once
 ```
 
-How the guards behave: the bot runs every call through `run_with_call_guards`
-(`voice/limits.py`), which `run_session` calls on the live path. It refuses a
-call once `VOICE_MAX_CONCURRENT_CALLS` is reached — the refused call is
-cancelled and never runs the pipeline — and a watchdog ends any call that passes
-`VOICE_MAX_CALL_SECONDS`, releasing the slot in a `finally` so a crash cannot
-leak it. This path is covered by regression tests with a fake runner
-(`tests/test_limits.py`): they assert the slot is released on success, on
-refusal, on a `run()` exception, and that the watchdog cancels a long call.
-What the tests do **not** cover is the real Pipecat `WorkerRunner` and a live
-audio call — do one test call that runs past the limit before trusting it in
-public.
+Also configure a strong `VOICE_TOKEN_SECRET` (at least 32 characters) with the
+same value on the text API and the voice bot, and never put it in frontend code or
+any browser-delivered configuration; the browser only ever receives short-lived
+tokens. See section 5.3 and the environment-variable table in 6.9 for details.
+
+How the guards behave: `run_session` (`voice/bot.py`) admits the call via
+`try_admit` **before any database work or persistence**, so a refused call
+creates no conversation row and touches no external state. Once admitted, the
+call is handed to `run_with_call_guards` (`voice/limits.py`) with
+`admitted=True`, which owns the slot release and cleanup from that point on. If
+setup fails after the conversation row is created but before the handover, the
+outer `finally` in `run_session` marks the row "ended" and releases the slot.
+The watchdog ends any call that passes `VOICE_MAX_CALL_SECONDS`, and a `finally`
+releases the slot so a crash cannot leak it. This path is covered by regression
+tests (`tests/test_limits.py`, `tests/test_voice_admission.py`): they assert
+that refused calls create no rows, the slot is released on success, refusal, or
+exception, and that partial-init failures are cleaned up. What the tests do
+**not** cover is the real Pipecat `WorkerRunner` and a live audio call — do one
+test call that runs past the limit before trusting it in public.
 
 **Limitation — the guard is per process (important for #4):** the limiter is a
 module-level counter in the runner process, so it bounds concurrent calls within
@@ -463,8 +509,8 @@ ever scale to more than one replica, move the counter to shared state (for
 example a Redis `INCR`/`DECR` with a TTL) or put a one-at-a-time limit in front
 of the service; until then, keep the voice bot at a single replica.
 
-Still missing: there is no user authentication, and leads are read with
-`python -m scripts.list_leads`, not over an authenticated HTTP endpoint. Keep
+Voice access requires a token (section 5.3). Leads are read with
+`python -m scripts.list_leads`, not over an HTTP endpoint. Keep
 the leads data behind the script, and tell demo visitors not to enter real
 personal details, because the consent gate stores a name and email.
 
@@ -483,9 +529,10 @@ personal details, because the consent gate stores a name and email.
 
 | Check | Result |
 |---|---|
-| `python -m pytest -q` | **PASS** — 93 tests, PostgreSQL 16 + pgvector 0.6.0, Python 3.13 |
+| `python -m pytest -q` | **PASS (local)** — 690 passed, 1 skipped, 2 warnings in 52.08 s (a Pipecat deprecation notice and a FastAPI duplicate OpenAPI operation ID notice), on the maintainer's Windows machine with Python 3.13. The PostgreSQL environment used for that run was not recorded. This is a local result, not a claim about any deployed environment. |
 | Config validation, health/readiness endpoints | **PASS** |
-| ICE parsing, ICE-in-logs has no credentials, production fail-fast gate | **PASS** (unit tests) |
+| ICE parsing, ICE-in-logs has no credentials, production fail-fast gate | **PASS** (`tests/test_ice.py`) |
+| `check_startup_config()` — startup guard raises `SystemExit` in production on bad config; no-op in development | **PASS** (`tests/test_production_guard.py`) — tests the function directly; the `__main__` entry point is not under test (it invokes the full Pipecat runner) |
 | Call-guard wiring on the run path (limiter + watchdog) | **PASS** — regression tests with a fake runner (not the real `WorkerRunner`) |
 | ICE → transport path (runner builds `SmallWebRTCConnection` with the servers) | **PASS by inspection** of the installed Pipecat 1.12 runner source |
 | Bot container start command (`-t webrtc --host --port`) | **PASS** — flags parse via the runner's argument parser |
@@ -517,14 +564,22 @@ account to open for each external credential is named.
 | `PIPECAT_ICE_SERVERS` | STUN URL + TURN URL/username/credential (see TURN below) |
 | `PIPECAT_ALLOWED_ORIGINS` | the Space's public origin, e.g. `https://<user>-<space>.hf.space` |
 | `VOICE_MAX_CALL_SECONDS`, `VOICE_MAX_CONCURRENT_CALLS` | `300`, `1` |
+| `VOICE_TOKEN_SECRET` | 32+ random characters, stored only as a platform secret. The text API must use the same value to mint tokens. Never sent to the browser. |
+| `VOICE_TOKEN_TTL_SECS` | `300` (optional) |
 
 **Text chat API — separate service (Render web service, port 8001)**
 
 Same `DATABASE_URL` / `DB_SSL` / Groq / TTS variables as above, plus Redis:
 set `REDIS_ENABLED=true` with `REDIS_PASSWORD`/`REDIS_HOST`/`REDIS_PORT` only if
 you attach a Redis/Key Value instance, otherwise `REDIS_ENABLED=false`. The API
-does not need the `PIPECAT_*` or `VOICE_*` variables. For a demo you can skip the
-API entirely — the voice bot is the public piece.
+does not need the `PIPECAT_*` variables or the other `VOICE_*` bot settings, but it
+does need `VOICE_TOKEN_SECRET` (the same value the voice bot has) and, optionally,
+`VOICE_TOKEN_TTL_SECS` (default `300`, allowed range 30 to 3600), because it mints
+the voice tokens through `POST /v1/voice/tokens` (section 5.3). Without
+`VOICE_TOKEN_SECRET` that endpoint answers `503` and every voice call is refused.
+A demo can omit this API only if another component you control holds the same
+`VOICE_TOKEN_SECRET` and mints valid tokens for your visitors' pages; there is no
+way to place a voice call without a token-minting path.
 
 **Neon (PostgreSQL + pgvector)**
 
@@ -546,3 +601,100 @@ API entirely — the voice bot is the public piece.
   them in `PIPECAT_ICE_SERVERS` as a JSON array alongside a STUN URL (6.2).
 - Google's public STUN (`stun:stun.l.google.com:19302`) is free for the STUN
   part; there is no free public TURN you should rely on for a real demo.
+
+### 6.10 Text API authentication and rollout
+
+**What is protected.** The two text-chat endpoints, `POST /v1/conversations` and
+`POST /v1/conversations/{conversation_id}/messages`, require a valid
+organization API key. Conversations and messages are scoped to the organization
+that owns the key; another organization's conversation id answers `404`.
+`/healthz` and `/readyz` are not behind the key, and `api/main.py` does not
+disable FastAPI's default `/docs` and `/openapi.json`.
+
+**Voice-call routes are not covered by this API key.** The key protects the
+text chat API and is what your server uses to mint voice tokens
+(`POST /v1/voice/tokens`, section 5.3). The voice runner's offer and `/start`
+endpoints require that short-lived token; the other protections for voice are the
+origin allow-list, the concurrent-call and call-duration limits, and the
+production ICE/origin checks in 6.2 and 6.6.
+
+**How clients send the key** (implemented in `api/deps.py`). Either header:
+
+```
+Authorization: Bearer <key>
+X-API-Key: <key>
+```
+
+`Authorization: Bearer` is read first; `X-API-Key` is used when there is no
+usable Bearer value. A missing key answers `401 "Missing API key"` and an
+unknown key `401 "Invalid API key"`; both carry `WWW-Authenticate: Bearer` and
+neither echoes the key. Send the key in a header only, never in a URL or query
+string, so it does not end up in access logs.
+
+**Database migration.** Revision `b7e1f0a2c3d4` ("add organization
+api_key_hash", after `25ae4fc65be4`) adds a nullable `organizations.api_key_hash`
+column (`VARCHAR(64)`) with the unique constraint
+`uq_organizations_api_key_hash`. It must be applied in **every other
+environment** (staging, hosted Postgres, production) before this version serves
+traffic:
+
+```bash
+alembic upgrade head
+alembic current          # expect b7e1f0a2c3d4 (or a later head)
+```
+
+Run it once against that environment's database as an explicit step (sections 4
+and 6.5), not on container boot. Existing organizations upgrade cleanly with a
+`NULL` hash and cannot authenticate until a key is minted. `alembic downgrade -1`
+removes the column and with it every stored key hash.
+
+**Creating and rotating keys** (`scripts/create_api_key.py`, run with the
+target environment's database configured):
+
+```bash
+python -m scripts.create_api_key --org <organization-slug>             # first key
+python -m scripts.create_api_key --org <organization-slug> --rotate    # replace an existing key
+```
+
+- It runs only in a real terminal. If stdout or stdin is piped, captured or in
+  a notebook, it exits **before** touching the database, so nothing is created
+  or lost.
+- An unknown slug exits with `Organization '<slug>' not found`.
+- If the organization already has a key, it refuses unless `--rotate` is given,
+  so a re-run cannot silently invalidate a live key. With `--rotate` the old key
+  stops working immediately.
+- The new key (prefix `vsa_`) is shown once, the script waits for Enter, then
+  clears the screen. Only its SHA-256 hash is stored, so a lost key cannot be
+  recovered; rotate instead.
+
+**Delivering and storing keys.**
+
+- Run the script in your own terminal, not inside CI, a screen recording, an
+  AI/chat session or anything that captures output.
+- Move the key straight into a password manager or the client's secret manager,
+  and hand it to the client over a secure channel. Never put it in Git, a
+  committed `.env`, logs, chat, tickets or email.
+- The server keeps only the hash. Treat any exposure of a raw key as a
+  compromise and rotate it.
+
+**Rollout checklist.**
+
+1. Apply the migration in the target environment.
+2. Mint a key for each organization that uses the text API.
+3. Update every text-API client to send the key **before** switching over;
+   until then they receive `401`.
+4. Verify that an unauthenticated request is refused (no key needed):
+   ```bash
+   curl -sS -i -X POST https://<api-host>/v1/conversations \
+     -H "Content-Type: application/json" \
+     -d '{"agent_id":"00000000-0000-0000-0000-000000000000"}'
+   # expected: HTTP 401 with "Missing API key"
+   ```
+
+## 7. Evaluation and tracing (optional)
+
+- **Results are files.** `python -m evals.run` writes `evals/results/<run_id>/`. The directory is git-ignored and excluded from the Docker image, so a container will not see results made on a laptop. To use the dashboard in a deployment, mount a volume at `EVAL_RESULTS_DIR` or run the dashboard where the runs are made.
+- **Dashboard.** `GET /dashboard/evals` serves a static page (strict CSP, no data). It calls `/v1/evals/*`, which require an organization API key and return only that organization's runs. Treat it as an internal page.
+- **`--mode full` writes data.** It creates conversations and leads for the evaluation organization and deletes them afterwards. It refuses to run with `APP_ENV=production`; run it against a staging database.
+- **Cost.** `--mode full` makes paid model calls. Use `--dry-run` first and keep `--max-llm-calls` set.
+- **LangSmith.** Off unless `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` are set and `requirements-eval.txt` is installed (it is not in `requirements.lock.txt`). Set the key as a platform secret, never in Git. Content tracing (`LANGSMITH_TRACE_CONTENT`) stays off for real visitor traffic. See `docs/LANGSMITH.md`.

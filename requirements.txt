@@ -16,3 +16,5 @@ pipecat-ai[groq,silero,runner,webrtc,deepgram]>=1.8
 fastembed
 pgvector
 email-validator
+langgraph
+mcp

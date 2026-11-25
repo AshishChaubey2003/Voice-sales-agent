@@ -66,23 +66,44 @@ async def call_duration_watchdog(
     await on_expired()
 
 
+def try_admit(limiter: CallLimiter) -> bool:
+    """Try to reserve one call slot. Returns True on success.
+
+    On refusal, logs a warning and returns False. The caller should return
+    immediately — no database work, no pipeline construction, no persistence.
+    """
+    if limiter.try_acquire():
+        return True
+    logger.warning(
+        f"Refusing call: {limiter.active}/{limiter.max_concurrent} "
+        "concurrent calls already in progress"
+    )
+    return False
+
+
 async def run_with_call_guards(
     *,
     runner: Runner,
     limiter: CallLimiter,
     max_call_seconds: int | None,
     cleanup: Callable[[], Awaitable[None]],
+    admitted: bool = False,
 ) -> str:
     """Run runner.run() under the concurrency limiter and the duration watchdog.
 
     This is the live call path, kept here (free of any Pipecat import) so it can
     be tested with a fake runner rather than only reasoned about.
 
+    When ``admitted`` is True the caller already holds one slot on ``limiter``
+    (acquired via :func:`try_admit`), so the guards skip the acquire and always
+    release in the finally. This avoids double-acquiring a slot when the
+    admission check lives in an outer wrapper.
+
     Returns "refused" when the concurrency limit was already reached (the runner
     is cancelled and never run), or "ran" when the call ran to completion.
     ``cleanup`` is awaited exactly once on every path.
     """
-    if not limiter.try_acquire():
+    if not admitted and not limiter.try_acquire():
         logger.warning(
             f"Refusing call: {limiter.active}/{limiter.max_concurrent} "
             "concurrent calls already in progress"
@@ -94,15 +115,17 @@ async def run_with_call_guards(
         await cleanup()
         return "refused"
 
-    watchdog = asyncio.create_task(
-        call_duration_watchdog(max_call_seconds, runner.cancel)
-    )
+    watchdog = None
     try:
+        watchdog = asyncio.create_task(
+            call_duration_watchdog(max_call_seconds, runner.cancel)
+        )
         await runner.run()
         return "ran"
     finally:
-        watchdog.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await watchdog
+        if watchdog is not None:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
         limiter.release()
         await cleanup()

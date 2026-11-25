@@ -200,3 +200,59 @@ async def test_duration_watchdog_ends_a_long_running_call():
     assert runner.cancelled is True
     assert limiter.active == 0
     assert cleaned == ["cleaned"]
+
+
+# --- admission handed over by the caller (finding A) ---------------------------
+@pytest.mark.anyio
+async def test_try_admit_reports_and_counts_a_slot():
+    from voice.limits import try_admit
+
+    limiter = CallLimiter(max_concurrent=1)
+    assert try_admit(limiter) is True
+    assert limiter.active == 1
+    assert try_admit(limiter) is False  # over the limit
+    assert limiter.active == 1          # a refusal never takes a slot
+
+
+@pytest.mark.anyio
+async def test_guards_run_an_already_admitted_call_without_taking_a_second_slot():
+    limiter = CallLimiter(max_concurrent=1)
+    assert limiter.try_acquire() is True  # the caller admitted the call up front
+
+    runner = FakeRunner()
+    cleaned = []
+    result = await run_with_call_guards(
+        runner=runner,
+        limiter=limiter,
+        max_call_seconds=None,
+        cleanup=lambda: _noop_cleanup(cleaned),
+        admitted=True,
+    )
+
+    assert result == "ran"                # not "refused", although the limiter was full
+    assert runner.ran is True
+    assert limiter.active == 0            # the guards own the slot and release it
+    assert cleaned == ["cleaned"]
+
+
+@pytest.mark.anyio
+async def test_guards_release_an_admitted_slot_even_when_run_raises():
+    limiter = CallLimiter(max_concurrent=1)
+    assert limiter.try_acquire() is True
+
+    class ExplodingRunner(FakeRunner):
+        async def run(self):
+            raise RuntimeError("pipeline blew up")
+
+    cleaned = []
+    with pytest.raises(RuntimeError):
+        await run_with_call_guards(
+            runner=ExplodingRunner(),
+            limiter=limiter,
+            max_call_seconds=None,
+            cleanup=lambda: _noop_cleanup(cleaned),
+            admitted=True,
+        )
+
+    assert limiter.active == 0
+    assert cleaned == ["cleaned"]
