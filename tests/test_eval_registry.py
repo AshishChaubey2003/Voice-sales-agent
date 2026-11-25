@@ -1,6 +1,9 @@
+from pathlib import Path
+
 import pytest
 
-from evals import registry as r
+from evals import aggregate, judge_suite, registry as r
+from evals.schema import parse_case
 
 
 def test_wilson_interval_known_values_and_bounds():
@@ -62,10 +65,10 @@ def test_every_threshold_is_marked_provisional_and_catalogue_is_honest():
     assert all(m["threshold"] is None or m["threshold"]["status"] == "provisional" for m in r.METRICS)
     cat = r.catalogue()
     statuses = {e["name"]: e["status"] for e in cat["evaluators"]}
-    assert statuses["Faithfulness / hallucination"] == "implemented_unrun"
+    assert statuses["Faithfulness / hallucination"] == "implemented_opt_in"
     assert statuses["Audio quality / interruptions / vocal affect"] == "not_implemented"
     assert statuses["PII leakage"] == "implemented"  # now scored inside every run
-    assert statuses["Tone and language"] == "implemented_unrun"
+    assert statuses["Tone and language"] == "implemented_opt_in"
     assert statuses["Toxicity"] == "not_implemented"
     assert "provisional" in cat["thresholds_note"]
     assert len({m["name"] for m in r.METRICS}) == len(r.METRICS)
@@ -111,3 +114,124 @@ def test_every_metric_depending_on_facts_or_a_judge_is_declared_so():
     deterministic = {"eval.pii_leak", "eval.tool_selection", "eval.conciseness"}
     judge_metrics = {m["name"] for m in r.METRICS if m["name"].startswith(("judge.", "eval."))} - deterministic
     assert judge_metrics == r._NEEDS_JUDGE
+
+
+# ---- registry is backed by the implementation ----
+
+def test_every_metric_the_aggregator_can_emit_is_registered_and_documented():
+    registered = {m["name"]: m for m in r.METRICS}
+    emitted = r.emitted_metrics()
+    assert set(emitted) <= set(registered)
+    undocumented = sorted(n for n in emitted if not registered[n]["documented"])
+    assert undocumented == [], f"emitted metrics without a curated definition: {undocumented}"
+
+
+def test_no_registered_metric_is_stale_and_directions_come_from_the_aggregator():
+    emitted = r.emitted_metrics()
+    for spec in r.METRICS:
+        assert spec["name"] in emitted, f"{spec['name']} is registered but nothing emits it"
+        assert spec["direction"] == emitted[spec["name"]]
+        if spec["threshold"]:
+            assert spec["threshold"]["direction"] == spec["direction"], spec["name"]
+    for name, direction in aggregate._SCORE_METRICS.values():
+        assert emitted[name] == direction
+
+
+def test_a_new_emitted_metric_without_a_curated_spec_is_appended_not_lost(monkeypatch):
+    monkeypatch.setitem(aggregate._SCORE_METRICS, "brand_new", ("answer.brand_new", "higher"))
+    monkeypatch.setattr(r, "METRICS", [s for s in r.METRICS if s["name"] != "answer.brand_new"])
+    r._build_registry()
+    added = [s for s in r.METRICS if s["name"] == "answer.brand_new"]
+    assert len(added) == 1 and added[0]["documented"] is False and added[0]["direction"] == "higher"
+    assert added[0]["n_unit"] in r.N_UNITS
+
+
+def test_retrieval_k_variants_follow_the_configured_ks():
+    names = {m["name"] for m in r.METRICS}
+    from evals.evaluators import RETRIEVAL_KS
+
+    for k in RETRIEVAL_KS:
+        assert {f"retrieval.recall_at_{k}", f"retrieval.precision_at_{k}"} <= names
+
+
+def test_deterministic_evaluator_list_matches_what_the_suite_really_emits():
+    case = parse_case({"id": "c1", "kind": "rag_answer", "category": "factual",
+                       "messages": [{"role": "user", "content": "How much is Pro?"}],
+                       "expected_sources": ["P"], "required_facts": ["29"]})
+    produced = [o["evaluator"] for o in judge_suite.deterministic_outcomes(case, {"reply": "Pro costs 29 dollars."})]
+    assert sorted(produced) == sorted(r.DETERMINISTIC_EVALUATORS)
+    for name in judge_suite.LLM_JUDGES:
+        assert f"eval.{name}" in r.emitted_metrics() and f"eval.{name}" in r._NEEDS_JUDGE
+
+
+# ---- every n has a unit ----
+
+def test_every_metric_has_a_valid_sample_size_unit():
+    for spec in r.METRICS:
+        assert spec["n_unit"] in r.N_UNITS, spec["name"]
+    by_name = {m["name"]: m["n_unit"] for m in r.METRICS}
+    assert by_name["retrieval.recall_at_4"] == by_name["retrieval.mrr"] == "queries"
+    assert by_name["lead.gate_false_save"] == "gate_decisions"
+    assert by_name["lead.false_save"] == "tool_decisions"
+    assert by_name["answer.required_facts"] == "replies"
+    assert by_name["run.pass_rate"] == "cases"
+    assert len(set(by_name.values())) > 1  # units are not collapsed into one generic label
+
+
+def test_resolved_rows_carry_unit_and_direction_and_show_unregistered_recorded_metrics():
+    metrics = {"retrieval.mrr": {"value": 0.5, "n": 38, "direction": "higher"},
+               "retrieval.recall_at_2": {"value": 0.7, "n": 38, "direction": "higher"},
+               "answer.brand_new": {"value": 0.9, "n": 5, "direction": "higher"}}
+    rows = {x["name"]: x for x in r.resolve_metrics(run(metrics))}
+    assert rows["retrieval.mrr"]["n_unit"] == "queries" and rows["retrieval.mrr"]["direction"] == "higher"
+    # --ks can record K values the registry does not list: shown with the generated K definition
+    assert rows["retrieval.recall_at_2"]["n_unit"] == "queries" and rows["retrieval.recall_at_2"]["documented"] is True
+    extra = rows["answer.brand_new"]
+    assert extra["status"] == "provisional" and extra["documented"] is False and "no curated" in extra["why_provisional"]
+    unavailable = rows["retrieval.recall_at_1"]
+    assert unavailable["status"] == "unavailable" and unavailable["value"] is None and unavailable["n_unit"] == "queries"
+
+
+# ---- evaluator and unavailable-metric honesty ----
+
+def test_evaluator_statuses_are_valid_and_nothing_claims_it_was_never_run():
+    cat = r.catalogue()
+    assert set(cat["evaluator_statuses"]) == set(r.EVALUATOR_STATUSES)
+    for e in cat["evaluators"]:
+        assert e["status"] in r.EVALUATOR_STATUSES, e["name"]
+        assert e["runs_with"], e["name"]
+        text = " ".join(str(v) for v in e.values()).lower()
+        assert "never run live" not in text and "implemented_unrun" not in text, e["name"]
+        if e["status"] in ("implemented", "implemented_opt_in"):
+            assert e["runs_with"] != "-", e["name"]
+
+
+def test_opt_in_evaluators_name_a_cli_flag_that_exists():
+    source = (Path(r.__file__).parent / "run.py").read_text(encoding="utf-8")
+    opt_in = [e for e in r.catalogue()["evaluators"] if e["status"] == "implemented_opt_in"]
+    assert opt_in
+    for e in opt_in:
+        flags = [f for f in ("--judge-suite", "--judge") if f in e["runs_with"]]
+        assert flags, e["name"]
+        for flag in flags:
+            assert f'"{flag}"' in source, f"{flag} is not a real evals.run option"
+        assert "--allow-llm" in e["runs_with"]  # paid calls need explicit permission
+
+
+def test_judge_backed_evaluators_are_opt_in_and_deterministic_ones_are_not():
+    by_name = {e["name"]: e for e in r.catalogue()["evaluators"]}
+    for name, e in by_name.items():
+        if e["kind"] == "LLM judge" and e["status"] != "not_implemented":
+            assert e["status"] == "implemented_opt_in", name
+        if e["kind"] == "Deterministic" and e["status"] == "implemented":
+            assert "--allow-llm" not in e["runs_with"], name
+
+
+def test_unavailable_metrics_stay_unavailable_with_a_reason_and_are_not_emitted():
+    names = [m["name"] for m in r.UNAVAILABLE_METRICS]
+    assert len(names) == len(set(names))
+    emitted = set(r.emitted_metrics())
+    for m in r.UNAVAILABLE_METRICS:
+        assert m["reason"].strip(), m["name"]
+        assert m["name"] not in emitted, f"{m['name']} is emitted now; remove it from UNAVAILABLE_METRICS"
+    assert {"retrieval.ndcg_at_k", "retrieval.context_recall", "operational.token_usage_cost"} <= set(names)
