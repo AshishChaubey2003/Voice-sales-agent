@@ -63,6 +63,11 @@ def _metric(values: list, direction: str, unit: str = "ratio") -> dict:
     return {"value": m.mean(present), "n": len(present), "direction": direction, "unit": unit}
 
 
+def _graded(results: list[dict]) -> list[dict]:
+    """Cases that ran without error and received a pass/fail verdict."""
+    return [r for r in results if r.get("status") == "ok" and r.get("passed") in (True, False)]
+
+
 def build_metrics(results: list[dict]) -> dict:
     scored = [r for r in results if r.get("status") == "ok"]
     collected: dict[str, list] = defaultdict(list)
@@ -87,16 +92,20 @@ def build_metrics(results: list[dict]) -> dict:
 
     ran = [r for r in results if r.get("status") in ("ok", "error")]
     errors = sum(1 for r in ran if r["status"] == "error")
-    passed = [r for r in ran if r.get("passed") is True]
     out["run.error_rate"] = {
         "value": errors / len(ran) if ran else None,
         "n": len(ran),
         "direction": "lower",
         "unit": "ratio",
     }
+    # Pass rate = passed / graded. Graded means the case ran without error and had at least one
+    # blocking check (passed is True or False). Errored cases are in error_rate; ungraded cases
+    # (passed is None) have no verdict and are in neither numerator nor denominator.
+    graded = _graded(results)
+    passed = [r for r in graded if r["passed"] is True]
     out["run.pass_rate"] = {
-        "value": len(passed) / len(ran) if ran else None,
-        "n": len(ran),
+        "value": len(passed) / len(graded) if graded else None,
+        "n": len(graded),
         "direction": "higher",
         "unit": "ratio",
     }
@@ -121,32 +130,56 @@ def build_breakdowns(results: list[dict]) -> dict:
     def group(key: str) -> dict:
         buckets: dict[str, list[dict]] = defaultdict(list)
         for result in results:
-            if result.get("status") in ("ok", "error"):
-                buckets[result[key]].append(result)
-        return {
-            name: {
+            buckets[result[key]].append(result)
+        out = {}
+        for name, members in sorted(buckets.items()):
+            items = [r for r in members if r.get("status") in ("ok", "error")]
+            if not items:
+                continue  # category with only skipped cases keeps its previous behaviour: not listed
+            graded = _graded(items)
+            passed = sum(1 for r in graded if r["passed"] is True)
+            out[name] = {
                 "n": len(items),
-                "passed": sum(1 for r in items if r.get("passed") is True),
+                "passed": passed,
+                "failed": len(graded) - passed,
+                "ungraded": sum(1 for r in items if r["status"] == "ok" and r.get("passed") is None),
+                "graded": len(graded),
                 "errors": sum(1 for r in items if r["status"] == "error"),
-                "pass_rate": sum(1 for r in items if r.get("passed") is True) / len(items),
+                "skipped": len(members) - len(items),
+                # passed / graded; None (never 0) when nothing in the category was graded
+                "pass_rate": passed / len(graded) if graded else None,
             }
-            for name, items in sorted(buckets.items())
-        }
+        return out
 
     return {"by_category": group("category"), "by_kind": group("kind")}
 
 
 def build_counts(results: list[dict]) -> dict:
     ran = [r for r in results if r.get("status") in ("ok", "error")]
+    graded = _graded(results)
+    passed = sum(1 for r in graded if r["passed"] is True)
+    failed = len(graded) - passed
+    ungraded = sum(1 for r in results if r.get("status") == "ok" and r.get("passed") is None)
+    errors = sum(1 for r in results if r.get("status") == "error")
+    skipped = sum(1 for r in results if r.get("status") == "skipped")
+    # Mutually exclusive buckets keyed on the result status. An errored case is stored with
+    # passed=False, so it is counted under errors only, never also under failed.
+    unaccounted = len(results) - (passed + failed + ungraded + errors + skipped)
     return {
         "total": len(results),
         "ran": len(ran),
-        "passed": sum(1 for r in ran if r.get("passed") is True),
-        "failed": sum(1 for r in ran if r.get("passed") is False),
-        "errors": sum(1 for r in ran if r["status"] == "error"),
-        "skipped": sum(1 for r in results if r.get("status") == "skipped"),
+        "passed": passed,
+        "failed": failed,
+        "ungraded": ungraded,
+        "graded": len(graded),
+        "errors": errors,
+        "skipped": skipped,
+        # 0 when every result has exactly one of the five statuses above; non-zero means a
+        # result with an unknown status or a malformed passed value.
+        "unaccounted": unaccounted,
+        "counts_consistent": unaccounted == 0,
         "known_gap_failures": sum(
-            1 for r in ran if r.get("known_gap") and r.get("passed") is False
+            1 for r in graded if r.get("known_gap") and r["passed"] is False
         ),
         # Cases with at least one failed judge call: the legacy --judge or any --judge-suite
         # evaluator that ended in status "error". Skipped evaluators are not errors.

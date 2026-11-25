@@ -15,12 +15,15 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api import live_eval
 from api.config import get_settings
 from api.deps import get_current_org, get_session
 from api.models import Conversation, Message, Organization
@@ -215,6 +218,88 @@ async def voice_latency(
     summary["window_days"] = days
     summary["truncated"] = len(rows) >= _VOICE_ROWS_CAP
     return summary
+
+
+# ---- live turns: persisted conversations evaluated after the fact (a different population from the runs above) ----
+
+# Conversations are stored as "text" or "voice"; "chat" is accepted as an alias for "text".
+_CHANNEL = "^(chat|text|voice)$"
+_STATUS = "^(passed|failed|ungraded|error|skipped)$"
+_CORRECTNESS = "^(correct|partial|incorrect)$"
+
+
+def _reference_dataset_path():
+    """None = the default golden dataset. Overridden in tests."""
+    return None
+
+
+class RefreshRequest(BaseModel):
+    force: bool = False  # re-evaluate turns that already have a result for this evaluator version
+    conversation_id: UUID | None = None
+    days: int | None = Field(default=30, ge=1, le=365)
+    limit: int = Field(default=500, ge=1, le=500)
+
+
+@router.get("/live/summary")
+async def live_summary(
+    days: int = Query(30, ge=1, le=365),
+    channel: str | None = Query(None, pattern=_CHANNEL),
+    conversation_id: UUID | None = None,
+    session: AsyncSession = Depends(get_session),
+    org: Organization = Depends(get_current_org),
+):
+    """Counts, graded pass rate, correctness, RAG and voice timings of this organization's evaluated live turns."""
+    return await live_eval.summarize_live(
+        session, org, days=days, channel=channel, conversation_id=conversation_id,
+        dataset_path=_reference_dataset_path(),
+    )
+
+
+@router.get("/live/latency")
+async def live_latency(
+    days: int = Query(30, ge=1, le=365),
+    channel: str | None = Query(None, pattern=_CHANNEL),
+    session: AsyncSession = Depends(get_session),
+    org: Organization = Depends(get_current_org),
+):
+    """Latency telemetry of this organization's persisted messages: a dataset of its own, not an evaluation."""
+    return await live_eval.latency_telemetry_for(session, org, days=days, channel=channel)
+
+
+@router.get("/live/turns")
+async def live_turns(
+    days: int = Query(30, ge=1, le=365),
+    channel: str | None = Query(None, pattern=_CHANNEL),
+    conversation_id: UUID | None = None,
+    status: str | None = Query(None, pattern=_STATUS),
+    correctness: str | None = Query(None, pattern=_CORRECTNESS),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    org: Organization = Depends(get_current_org),
+):
+    """Per-turn results with the evidence behind each verdict. Transcript text is masked."""
+    return await live_eval.list_turns(
+        session, org, days=days, channel=channel, conversation_id=conversation_id, status=status,
+        correctness=correctness, limit=limit, offset=offset,
+    )
+
+
+@router.post("/live/refresh")
+async def live_refresh(
+    body: RefreshRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+    org: Organization = Depends(get_current_org),
+):
+    """Evaluate this organization's not-yet-evaluated assistant turns (idempotent; force re-evaluates).
+
+    Runs deterministic checks only: no LLM call, no external request. Turns of other organizations are never touched.
+    """
+    body = body or RefreshRequest()
+    return await live_eval.evaluate_turns(
+        session, org, conversation_id=body.conversation_id, days=body.days, force=body.force, limit=body.limit,
+        dataset_path=_reference_dataset_path(),
+    )
 
 
 @page_router.get("/dashboard/evals", response_class=HTMLResponse, include_in_schema=False)

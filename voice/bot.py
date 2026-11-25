@@ -360,6 +360,7 @@ async def _run_admitted_session(transport, runner_args, settings, session_factor
         settings=settings,
         rewriter=rewriter,
         on_retrieval=recorder.record_retrieval,
+        on_retrieval_detail=recorder.record_retrieval_detail,
         conversation_id=conversation_id,
     )
 
@@ -377,7 +378,9 @@ async def _run_admitted_session(transport, runner_args, settings, session_factor
     async def on_assistant_turn_stopped(aggregator, message):
         await recorder.assistant_turn_finished(message.content, message.interrupted)
 
-    ttfb_observer = ServiceTTFBObserver(recorder.record_service_ttfb)
+    ttfb_observer = ServiceTTFBObserver(
+        recorder.record_service_ttfb, on_metric=recorder.record_service_metric
+    )
     latency_observer = UserBotLatencyObserver()
 
     @latency_observer.event_handler("on_latency_measured")
@@ -387,6 +390,10 @@ async def _run_admitted_session(transport, runner_args, settings, session_factor
     @latency_observer.event_handler("on_first_bot_speech_latency")
     async def on_first_bot_speech_latency(observer, latency):
         recorder.record_first_speech(latency)
+
+    @latency_observer.event_handler("on_latency_breakdown")
+    async def on_latency_breakdown(observer, breakdown):
+        recorder.record_breakdown(breakdown)
 
     pipeline = Pipeline(
         [

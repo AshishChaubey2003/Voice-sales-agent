@@ -144,6 +144,18 @@ class TurnTrace:
     def active(self) -> bool:
         return self._run is not None
 
+    @property
+    def run_id(self) -> str | None:
+        """The LangSmith run id of this parent run, or None when tracing is off or no run was started.
+
+        Never invented: it is read from the run object the SDK returned.
+        """
+        try:
+            value = getattr(self._run, "id", None) if self._run is not None else None
+            return str(value) if value else None
+        except Exception:
+            return None
+
     def set_outputs(self, **outputs: Any) -> None:
         """Adds redacted summary values (counts, statuses) to the parent run."""
         self._outputs.update(outputs)

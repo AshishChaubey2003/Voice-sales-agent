@@ -97,8 +97,30 @@
     <div id="trend"></div>
   </section>
   <div id="detail"></div>
+  <section class="card" id="live-card" hidden>
+    <h2>Live conversations (persisted turns)</h2>
+    <p class="muted">Not an offline evaluation run: these are assistant turns from real chat and voice conversations, evaluated after they were saved. Counts are turns, not conversations, and are never added to the run numbers above.</p>
+    <div class="row filters">
+      <label>Channel <select id="l-channel" aria-label="Filter live turns by channel"><option value="">all</option><option value="voice">voice</option><option value="text">chat (text)</option></select></label>
+      <label>Period <select id="l-days" aria-label="Period in days"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></label>
+      <label>Status <select id="l-status" aria-label="Filter live turns by status"><option value="">all</option><option value="passed">passed</option><option value="failed">failed</option><option value="ungraded">ungraded</option><option value="error">error</option><option value="skipped">skipped</option></select></label>
+      <label>Verdict <select id="l-correctness" aria-label="Filter live turns by correctness"><option value="">all</option><option value="correct">correct</option><option value="partial">partial</option><option value="incorrect">incorrect</option></select></label>
+      <button type="button" id="l-refresh">Evaluate new turns</button>
+      <button type="button" id="l-reload">Reload</button>
+      <span class="muted" id="l-updated"></span>
+    </div>
+    <div id="live"></div>
+    <div id="live-turns"></div>
+  </section>
   <section class="card" id="voice-card" hidden>
-    <h2>Voice call latency (live telemetry)</h2>
+    <h2>Latency telemetry (persisted messages)</h2>
+    <p class="muted">A dataset of its own: durations of saved chat and voice messages, measured on the server. It is not an evaluation run and not a live-turn evaluation, and none of it is added to pass/fail counts. Each row says what it measures, how many observations it has, and what the unit of n is.</p>
+    <div class="row filters">
+      <label>Channel <select id="v-channel" aria-label="Filter latency by channel"><option value="">all</option><option value="voice">voice</option><option value="text">chat (text)</option></select></label>
+      <label>Period <select id="v-days" aria-label="Latency period in days"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></label>
+      <button type="button" id="v-reload">Reload</button>
+      <span class="muted" id="v-updated"></span>
+    </div>
     <div id="voice"></div>
   </section>
 </main>
@@ -128,6 +150,21 @@
   function $(id) { return document.getElementById(id); }
 
   function fmtRatio(v) { return v == null ? "n/a" : v.toFixed(3); }
+  // Counts are mutually exclusive: passed + failed + ungraded + errors + skipped = total.
+  // Runs saved before graded/ungraded existed have no "ungraded" field; say so instead of guessing.
+  function countsText(c) {
+    if (c.ungraded == null) {
+      return "ran " + c.ran + "/" + c.total + " · passed " + c.passed + " · failed " + c.failed + " · errors " + c.errors + " · skipped " + c.skipped + " · ungraded not recorded (older run)";
+    }
+    var text = "total " + c.total + " = passed " + c.passed + " + failed " + c.failed + " + ungraded " + c.ungraded + " + errors " + c.errors + " + skipped " + c.skipped;
+    if (c.counts_consistent === false) text += " · WARNING: " + c.unaccounted + " result(s) have an unrecognised status";
+    return text;
+  }
+  function passRateText(metric, c) {
+    if (!metric || metric.value == null) return "n/a (no graded cases)";
+    if (c.graded == null) return fmtRatio(metric.value) + " · older run: denominator may include ungraded cases";
+    return fmtRatio(metric.value) + " (" + c.passed + " of " + c.graded + " graded; " + c.ungraded + " ungraded, " + c.errors + " errored and " + c.skipped + " skipped cases excluded)";
+  }
   function fmtMs(v) { return v == null ? "n/a" : Math.round(v) + " ms"; }
   function fmtTime(s) {
     if (!s) return "n/a";
@@ -181,6 +218,16 @@
       });
   }
 
+  function apiPost(path, body) {
+    return fetch(path, { method: "POST", headers: { "Authorization": "Bearer " + apiKey, "Accept": "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}), cache: "no-store" })
+      .then(function (res) {
+        if (res.status === 401) throw new Error("The API key is missing or invalid.");
+        if (!res.ok) throw new Error("The server returned an error (" + res.status + "). If this is new, run: alembic upgrade head");
+        return res.json();
+      });
+  }
+
   // ---- run list ----
   function loadRuns() {
     setStatus("Loading evaluation runs…");
@@ -192,9 +239,10 @@
       setupFilters(allRuns);
       applyFilters();
       loadVoice();
+      loadLive();
       if (data.runs.length) selectRun(data.runs[0].run_id);
     }).catch(function (err) {
-      $("runs-card").hidden = true; $("voice-card").hidden = true; clear($("detail"));
+      $("runs-card").hidden = true; $("voice-card").hidden = true; $("live-card").hidden = true; clear($("detail"));
       setStatus(err.message, "error");
     }).then(function () { $("load").disabled = false; });
   }
@@ -383,7 +431,9 @@
     var suite = run.judge_suite || {};
     item("Judge suite", suite.enabled ? "on · " + (suite.model || "n/a") : "off (deterministic checks only)");
     item("LangSmith", ls.url ? safeLink(ls.url, "open experiment") : (ls.status || "off"));
-    item("Counts", "ran " + counts.ran + "/" + counts.total + " · passed " + counts.passed + " · failed " + counts.failed + " · errors " + counts.errors + " · skipped " + counts.skipped);
+    item("Counts", countsText(counts));
+    var passMetric = (run.metrics || {})["run.pass_rate"];
+    item("Pass rate", passRateText(passMetric, counts));
 
     var overview = h("section", { "class": "card" }, [h("h2", { text: "Run details" })]);
     var reviewNotice = null;
@@ -450,18 +500,18 @@
       return card;
     }
     card.appendChild(h("div", { "class": "banner", text: catalogue.thresholds_note }));
-    card.appendChild(table(["Metric", "Value", "Counts (rate metrics)", "Threshold (warn / critical)", "Level", "Status"], resolved.metrics.map(function (m) {
+    card.appendChild(table(["Metric", "Value", "Counts (n = unit counted)", "Threshold (warn / critical)", "Level", "Status"], resolved.metrics.map(function (m) {
       var t = m.threshold;
       return [m.name, m.value == null ? "unavailable" : fmtRatio(m.value),
-        m.rate ? fmtRate(m.rate) + (m.rate.note ? " \u2013 " + m.rate.note : "") : (m.n ? "n=" + m.n : "n/a"),
+        m.rate ? fmtRate(m.rate) + " " + (m.n_unit || "") + (m.rate.note ? " \u2013 " + m.rate.note : "") : (m.n ? "n=" + m.n + " " + (m.n_unit || "") : "n/a"),
         t ? t.direction + " is better: " + t.warn + " / " + t.critical + " (provisional)" : "none set",
         m.level || "n/a", m.status + (m.why_provisional ? " \u2013 " + m.why_provisional : "")];
     })));
     card.appendChild(h("h3", { "class": "muted subhead", text: "Not measured anywhere yet" }));
     card.appendChild(table(["Metric", "Why"], catalogue.unavailable_metrics.map(function (m) { return [m.name, m.reason]; })));
     card.appendChild(h("h3", { "class": "muted subhead", text: "Evaluator catalogue" }));
-    card.appendChild(table(["Evaluator", "Category", "Kind", "Status", "Notes"], catalogue.evaluators.map(function (e) {
-      return [e.name, e.category, e.kind, e.status.replace(/_/g, " "), e.notes];
+    card.appendChild(table(["Evaluator", "Category", "Kind", "Status", "Runs with", "Notes"], catalogue.evaluators.map(function (e) {
+      return [e.name, e.category, e.kind, e.status.replace(/_/g, " "), e.runs_with || "n/a", e.notes];
     })));
     return card;
   }
@@ -552,10 +602,15 @@
     var cats = run.by_category || {};
     var rows = Object.keys(cats).map(function (k) {
       var c = cats[k];
-      return [k, String(c.n), String(c.passed), bar(c.pass_rate), String(c.errors)];
+      var legacy = c.graded == null;  // older runs: pass_rate used all ran cases as the denominator
+      return [k, String(c.n), legacy ? "n/a" : String(c.graded), String(c.passed), legacy ? "n/a" : String(c.ungraded),
+        String(c.errors), c.pass_rate == null ? "n/a" : bar(c.pass_rate)];
     });
     if (!rows.length) card.appendChild(h("p", { "class": "muted", text: "No cases ran." }));
-    else card.appendChild(table(["Category", "Cases", "Passed", "Pass rate", "Errors"], rows, 1));
+    else {
+      card.appendChild(table(["Category", "Ran", "Graded", "Passed", "Ungraded", "Errors", "Pass rate (passed / graded)"], rows, 1));
+      card.appendChild(h("p", { "class": "muted", text: "Pass rate = passed / graded. Ungraded cases (no blocking check) and errors are not counted as passes or failures; n/a means nothing in the category was graded. Runs saved before this change show n/a for graded and ungraded." }));
+    }
     return card;
   }
 
@@ -623,33 +678,214 @@
     return card;
   }
 
-  // ---- voice telemetry ----
+  // ---- live conversations: persisted turns evaluated after the fact (units are TURNS) ----
+  function liveQuery(extra) {
+    var q = ["days=" + encodeURIComponent($("l-days").value)];
+    if ($("l-channel").value) q.push("channel=" + encodeURIComponent($("l-channel").value));
+    return q.concat(extra || []).join("&");
+  }
+  function pct(v) { return v == null ? "n/a" : (v * 100).toFixed(1) + "%"; }
+  function turnBadge(status) {
+    return badge(status, status === "passed" ? "good" : status === "failed" || status === "error" ? "bad" : "warn");
+  }
+
+  function loadLive() {
+    var box = $("live"), turns = $("live-turns");
+    $("live-card").hidden = false;
+    clear(box); clear(turns);
+    box.appendChild(h("p", { "class": "muted", text: "Loading…" }));
+    var extra = [];
+    if ($("l-status").value) extra.push("status=" + encodeURIComponent($("l-status").value));
+    if ($("l-correctness").value) extra.push("correctness=" + encodeURIComponent($("l-correctness").value));
+    Promise.all([
+      api("/v1/evals/live/summary?" + liveQuery()),
+      api("/v1/evals/live/turns?" + liveQuery(extra.concat(["limit=50"])))
+    ]).then(function (res) {
+      renderLive(res[0]);
+      renderLiveTurns(res[1]);
+      $("l-updated").textContent = "Last updated " + fmtTime(res[0].generated_at);
+    }).catch(function (err) {
+      clear(box);
+      box.appendChild(h("div", { "class": "banner error", text: err.message + " (the live section needs the turn_evaluations table: alembic upgrade head)" }));
+    });
+  }
+
+  function renderLive(s) {
+    var box = $("live");
+    clear(box);
+    var ref = s.reference || {};
+    box.appendChild(h("div", { "class": "banner", text: "All verdicts are provisional. " + (ref.provisional_note || "") +
+      (ref.available ? " Reference: " + (ref.dataset.name || "dataset") + " (" + (ref.dataset.usable_references || 0) + " usable exact-match questions, " + (ref.dataset.reviewed_cases == null ? "?" : ref.dataset.reviewed_cases) + " human-reviewed cases)."
+        : " No reference dataset applies to this organization, so every turn is ungraded.") }));
+    if (s.truncated) box.appendChild(h("div", { "class": "banner", text: "Showing the most recent rows only; older turns in this period are not included." }));
+    var c = s.counts || {};
+    box.appendChild(h("p", { text: s.turns + " assistant turns in " + s.conversations + " conversations (" + s.window_days + " days" + (s.channel ? ", " + s.channel : "") + "); " + s.pending + " not evaluated yet." }));
+    if (!s.turns && !s.pending) {
+      box.appendChild(h("p", { "class": "muted", text: "No persisted assistant turns in this period." }));
+      return;
+    }
+    box.appendChild(table(["Status", "Turns", "Meaning"], [
+      ["passed", String(c.passed), "graded against a reference; every blocking check passed"],
+      ["failed", String(c.failed), "graded against a reference; a blocking check failed"],
+      ["ungraded", String(c.ungraded), "no trusted reference for the question (never counted as pass or fail)"],
+      ["error", String(c.error), "the evaluator failed; the conversation itself is unaffected"],
+      ["skipped", String(c.skipped), "empty or interrupted reply, not judged"],
+      ["pending", String(s.pending), "saved but not evaluated yet: press Evaluate new turns"]
+    ], 1));
+    box.appendChild(h("p", null, [h("strong", { text: "Graded pass rate: " }),
+      s.pass_rate.value == null ? "n/a (no graded turns)" : pct(s.pass_rate.value) + " (" + c.passed + " of " + c.graded + " graded " + s.pass_rate.n_unit + ")"]));
+    box.appendChild(h("p", { "class": "muted", text: "Ungraded rate: " + pct(s.ungraded_rate.value) + " of " + s.ungraded_rate.n + " evaluated turns have no trusted reference." }));
+
+    var k = s.correctness || {};
+    box.appendChild(h("h3", { "class": "muted subhead", text: "Correctness (provisional) – " + s.correctness_n.n + " turns with a verdict, " + s.correctness_n.provisional_turns + " against unreviewed facts" }));
+    box.appendChild(table(["Verdict", "Turns", "Share of verdicts"], ["correct", "partial", "incorrect"].map(function (name) {
+      return [name, String(k[name].count), pct(k[name].rate)];
+    }), 1));
+    var cc = s.conversation_correctness || {};
+    box.appendChild(h("p", { "class": "muted", text: "Conversation level: " + (cc.rate == null ? "n/a" : cc.all_correct + " of " + cc.graded_conversations + " conversations had every judged turn correct") + " (unit: conversations)." }));
+
+    box.appendChild(h("h3", { "class": "muted subhead", text: "Retrieval (RAG) of live turns" }));
+    var rag = s.rag || {};
+    var ragRows = ["recall_at_1", "recall_at_3", "recall_at_4", "precision_at_4", "mrr", "empty_retrieval_rate"].map(function (name) {
+      return [name, rag[name].value == null ? "n/a" : fmtRatio(rag[name].value), String(rag[name].n), rag[name].n_unit];
+    });
+    box.appendChild(table(["Metric", "Value", "n", "n counts"], ragRows, 1));
+    box.appendChild(h("p", { "class": "muted", text: "Recall, precision and MRR exist only for turns that matched a dataset case (they have expected sources). Retrieval not recorded: " +
+      rag.retrieval_not_recorded.not_instrumented + " turns not instrumented, " + rag.retrieval_not_recorded.error + " retrieval errors." }));
+
+    box.appendChild(h("h3", { "class": "muted subhead", text: "Voice timings of the evaluated voice turns (" + s.voice_timings.voice_turns + " turns)" }));
+    var stageRows = Object.keys(s.voice_timings.stages).map(function (stage) {
+      var st = s.voice_timings.stages[stage];
+      return st ? [stage, String(st.n), fmtMs(st.p50), fmtMs(st.p90), fmtMs(st.p95)] : [stage, "0", "Not instrumented", "n/a", "n/a"];
+    });
+    box.appendChild(table(["Stage", "n", "p50", "p90", "p95"], stageRows, 1));
+    box.appendChild(h("p", { "class": "muted", text: s.voice_timings.note + " Percentiles appear only with enough observations (p90 ≥ 10, p95 ≥ 20)." }));
+  }
+
+  function renderLiveTurns(data) {
+    var box = $("live-turns");
+    clear(box);
+    box.appendChild(h("h3", { "class": "muted subhead", text: "Turns (" + data.total + ")" }));
+    if (!data.turns.length) {
+      box.appendChild(h("p", { "class": "muted", text: "No evaluated turns match these filters." }));
+      return;
+    }
+    data.turns.forEach(function (t) {
+      var d = h("details", { "class": "case" });
+      var label = fmtTime(t.created_at) + " · " + t.channel + " · " + (t.question || "(no question)").slice(0, 90);
+      d.appendChild(h("summary", null, [turnBadge(t.status), " ", t.correctness ? badge(t.correctness + (t.correctness_provisional ? " (provisional)" : ""), t.correctness === "correct" ? "good" : "warn") : "", " " + label]));
+      d.appendChild(h("p", null, [h("strong", { text: "Question: " }), t.question || "n/a"]));
+      d.appendChild(h("p", null, [h("strong", { text: "Reply: " }), t.reply]));
+      d.appendChild(h("p", { "class": "muted", text: "Reference: " + t.reference.quality + (t.reference.case_id ? " (case " + t.reference.case_id + ")" : "") + (t.ungraded_reason ? " · " + t.ungraded_reason : "") + (t.correctness_reason ? " · " + t.correctness_reason : "") }));
+      (t.checks || []).forEach(function (c) {
+        d.appendChild(h("pre", { text: (c.passed === true ? "✓ " : c.passed === false ? "✗ " : "– ") + c.name + (c.blocking ? "" : " (informational)") + (c.detail ? ": " + c.detail : "") }));
+      });
+      (t.flags || []).forEach(function (f) { d.appendChild(h("pre", { text: "⚠ " + f.name + ": " + f.detail + " (signal, not a verdict)" })); });
+      var src = t.retrieval && t.retrieval.state === "measured" ? (t.retrieval.sources.join("; ") || "nothing retrieved") : "retrieval " + (t.retrieval ? t.retrieval.state : "unknown").replace(/_/g, " ");
+      d.appendChild(h("p", { "class": "muted", text: "Retrieved: " + src }));
+      var timings = Object.keys(t.timings || {}).filter(function (k2) { return typeof t.timings[k2] === "number"; })
+        .map(function (k2) { return k2 + " " + Math.round(t.timings[k2]) + " ms"; });
+      d.appendChild(h("p", { "class": "muted", text: "Timings: " + (timings.join(" · ") || "none recorded") + " · LangSmith run: " + (t.trace_id || "not recorded") }));
+      var parts = (t.timings || {}).latency_breakdown;
+      if (parts && parts.length) {
+        d.appendChild(h("p", { "class": "muted", text: "Where the time went (Pipecat, " + ((t.timings || {}).breakdown_from || "unknown anchor").replace(/_/g, " ") + "): " +
+          parts.map(function (p) { return p.key + " " + Math.round(p.ms) + " ms"; }).join(" · ") }));
+      }
+      if (t.error) d.appendChild(h("p", { text: "Evaluator error: " + t.error }));
+      d.appendChild(h("p", { "class": "muted", text: "Conversation " + t.conversation_id + " · message " + t.message_id }));
+      box.appendChild(d);
+    });
+    if (data.total > data.turns.length) box.appendChild(h("p", { "class": "muted", text: "Showing the most recent " + data.turns.length + " of " + data.total + "." }));
+  }
+
+  function refreshLive() {
+    var button = $("l-refresh");
+    button.disabled = true;
+    $("l-updated").textContent = "Evaluating…";
+    apiPost("/v1/evals/live/refresh", { days: parseInt($("l-days").value, 10) }).then(function (r) {
+      loadLive();
+      $("l-updated").textContent = "Evaluated " + r.written + " new turns; " + r.remaining_pending + " still pending.";
+    }).catch(function (err) {
+      $("l-updated").textContent = err.message;
+    }).then(function () { button.disabled = false; });
+  }
+  ["l-channel", "l-days", "l-status", "l-correctness"].forEach(function (id) { $(id).addEventListener("change", loadLive); });
+  $("l-refresh").addEventListener("click", refreshLive);
+  $("l-reload").addEventListener("click", loadLive);
+
+  // ---- latency telemetry (a dataset of its own: persisted messages, not evaluations) ----
+  function fmtStat(v) { return v == null ? "n/a" : Math.round(v); }
   function loadVoice() {
     var box = $("voice");
     $("voice-card").hidden = false;
     clear(box);
     box.appendChild(h("p", { "class": "muted", text: "Loading…" }));
-    api("/v1/evals/voice-latency?days=30").then(function (v) {
-      clear(box);
-      var labels = Object.keys(v.configs);
-      if (!labels.length) {
-        box.appendChild(h("p", { text: "No voice calls with latency data in the last " + v.window_days + " days." }));
-        return;
-      }
-      box.appendChild(h("p", { "class": "muted", text: v.assistant_turns + " assistant turns in " + v.window_days + " days; " + v.interrupted_turns + " interrupted" + (v.interruption_rate == null ? "" : " (" + (v.interruption_rate * 100).toFixed(1) + "%)") + "." }));
-      labels.forEach(function (label) {
-        box.appendChild(h("h3", { "class": "muted subhead", text: label }));
-        var rows = Object.keys(v.configs[label]).map(function (metric) {
-          var s = v.configs[label][metric];
-          return [metric, String(s.n), fmtMs(s.p50), fmtMs(s.p90), fmtMs(s.p95), fmtMs(s.p99)];
-        });
-        box.appendChild(table(["Metric", "n", "p50", "p90", "p95", "p99"], rows, 1));
-      });
+    var query = "days=" + encodeURIComponent($("v-days").value) + ($("v-channel").value ? "&channel=" + encodeURIComponent($("v-channel").value) : "");
+    api("/v1/evals/live/latency?" + query).then(function (d) {
+      renderLatency(d);
+      $("v-updated").textContent = "Last updated " + fmtTime(d.generated_at);
     }).catch(function (err) {
       clear(box);
       box.appendChild(h("div", { "class": "banner error", text: err.message }));
     });
   }
+
+  function renderLatency(d) {
+    var box = $("voice");
+    clear(box);
+    var pp = d.percentile_policy || {};
+    if (d.truncated) box.appendChild(h("div", { "class": "banner", text: "Showing the most recent rows only; older messages in this period are not included." }));
+    var shown = 0;
+    [["voice", "Voice"], ["text", "Chat (text)"]].forEach(function (pair) {
+      var ch = d.channels[pair[0]];
+      if (!ch || (d.channel && d.channel !== pair[0] && !(d.channel === "chat" && pair[0] === "text"))) return;
+      var o = ch.outcomes;
+      box.appendChild(h("h3", { "class": "muted subhead", text: pair[1] + ": " + ch.messages.assistant + " assistant messages, " + ch.messages.user + " visitor messages (" + d.window_days + " days)" }));
+      if (!ch.messages.assistant && !ch.messages.user) {
+        box.appendChild(h("p", { "class": "muted", text: "No persisted " + pair[1].toLowerCase() + " messages in this period." }));
+        return;
+      }
+      shown += 1;
+      var rows = ch.metrics.map(function (m) {
+        var st = m.stats;
+        if (!st) return [m.label, m.measure, "n/a", "Not instrumented", "n/a", "n/a", "n/a"];
+        return [m.label, m.measure, String(m.n) + " " + m.n_unit, st.p50 == null ? "n<" + pp.p50_min_n + " (min " + fmtStat(st.min) + ", max " + fmtStat(st.max) + ")" : fmtMs(st.p50),
+          st.p90 == null ? "n/a" : fmtMs(st.p90), st.p95 == null ? "n/a" : fmtMs(st.p95), fmtMs(st.max)];
+      });
+      box.appendChild(table(["Metric", "Measures", "n", "p50", "p90", "p95", "max"], rows, 2));
+      var defs = h("details", { "class": "case" }, [h("summary", { text: "Exactly what each metric measures" })]);
+      ch.metrics.forEach(function (m) {
+        defs.appendChild(h("p", { "class": "muted", text: m.label + " [" + m.key + ", " + m.unit + ", " + m.role + " message] — " + m.description + " Source: " + m.source + "; clock: " + m.clock + "; measured on the server." }));
+      });
+      box.appendChild(defs);
+      var facts = ["turns with no timing at all: " + o.turns_without_any_timing, "retrieval errors (excluded from retrieval timings): " + o.retrieval_errors];
+      if (o.interrupted != null) facts.push("interrupted by the visitor: " + o.interrupted);
+      if (o.with_langsmith_run_id != null) facts.push("with a LangSmith run id: " + o.with_langsmith_run_id);
+      box.appendChild(h("p", { "class": "muted", text: "Outcomes (unit: " + o.n_unit + "): " + facts.join(" · ") + "." }));
+      if (ch.pooled_across_configurations) {
+        box.appendChild(h("div", { "class": "banner", text: "These numbers pool " + ch.configurations_observed.length + " configurations: " + ch.configurations_observed.join(" / ") + "." }));
+      }
+      if (ch.breakdown) {
+        var b = ch.breakdown;
+        box.appendChild(h("h3", { "class": "muted subhead", text: "Where a voice turn's time went (" + b.n_turns + " " + b.n_unit + ")" }));
+        if (!b.parts.length) {
+          box.appendChild(h("p", { "class": "muted", text: "No per-turn breakdown recorded yet: turns saved before this was instrumented have none." }));
+        } else {
+          box.appendChild(table(["Part", "n", "p50", "max"], b.parts.map(function (part) {
+            return [part.key, String(part.n), part.stats.p50 == null ? "n<" + pp.p50_min_n : fmtMs(part.stats.p50), fmtMs(part.stats.max)];
+          }), 1));
+          box.appendChild(h("p", { "class": "muted", text: b.note + (b.excluded_other_anchor ? " " + b.excluded_other_anchor + " greeting breakdown(s) measured from client connection are excluded." : "") }));
+        }
+      }
+    });
+    if (!shown) box.appendChild(h("p", { "class": "muted", text: "No messages with latency data in this period." }));
+    var nr = h("details", { "class": "case" }, [h("summary", { text: "Not recorded (cannot be shown)" })]);
+    (d.not_recorded || []).forEach(function (line) { nr.appendChild(h("p", { "class": "muted", text: line })); });
+    box.appendChild(nr);
+    box.appendChild(h("p", { "class": "muted", text: "Percentiles appear only with enough observations: p50 needs n ≥ " + pp.p50_min_n + ", p90 ≥ " + pp.p90_min_n + ", p95 ≥ " + pp.p95_min_n + ". A metric with no recorded values is shown as Not instrumented, never as 0." }));
+  }
+  ["v-channel", "v-days"].forEach(function (id) { $(id).addEventListener("change", loadVoice); });
+  $("v-reload").addEventListener("click", loadVoice);
 
   $("auth-form").addEventListener("submit", function (e) {
     e.preventDefault();
