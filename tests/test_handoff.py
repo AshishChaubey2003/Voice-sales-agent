@@ -360,7 +360,7 @@ async def test_sales_dashboard_page_is_served_with_a_strict_csp_and_no_innerhtml
 
 
 def _settings(**kw):
-    base = dict(_env_file=None, groq_api_key="x", groq_model="m", postgres_user="u", postgres_password="p", postgres_db="d")
+    base = dict(_env_file=None, groq_api_key="x", groq_model="m", postgres_user="u", postgres_password="p", postgres_db="d", redis_enabled=False)
     base.update(kw)
     return Settings(**base)
 
