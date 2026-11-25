@@ -15,3 +15,9 @@ aiortc==1.15.0
 
 langgraph==1.2.24
 mcp==2.3.0
+
+# Lint tooling, pinned for the same reason. `pip install ruff` is unpinned by default and
+# resolved ruff 0.17.6 on 2026-11-25; its default rule set is much wider than the classic
+# E/F pair, which failed CI with 280 findings on code that had never been linted. The rules
+# this project actually enforces are declared in ruff.toml, not left to the ruff default.
+ruff==0.17.6

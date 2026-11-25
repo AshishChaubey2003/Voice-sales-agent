@@ -11,6 +11,13 @@ name: CI
 # was validated against (pipecat-ai 1.12.0). requirements.txt alone would resolve a newer,
 # untested release. See the header of constraints-ci.txt before changing the pins.
 #
+# The test job does not depend on quality: a lint or format finding must not stop the suite
+# from running. Each job reports its own result.
+#
+# Lint tooling is pinned through constraints-ci.txt as well. An unpinned `pip install ruff`
+# resolved 0.17.6 on 2026-11-25, whose default rule set is far wider than this repo was
+# written against; ruff.toml now states the selected rules explicitly.
+#
 # NOT run here: the Chromium check (tests/js/voice-client.browser.mjs), real audio over a
 # network, and anything against a hosted database.
 
@@ -47,14 +54,18 @@ jobs:
       - name: Install tools
         run: |
           python -m pip install --upgrade pip
-          pip install ruff pyright
+          pip install ruff pyright -c constraints-ci.txt
           pip install -r requirements.txt -c constraints-ci.txt
       - name: Ruff lint
         run: ruff check api/ tests/ evals/ scripts/ voice/
       - name: Ruff format check
         run: ruff format --check api/ tests/ evals/ scripts/ voice/
-      - name: Pyright type check (basic)
-        run: pyright api/ --pythonversion 3.13 --level basic
+      # pyright 1.1.414 has no --typeCheckingMode flag and its --level takes only
+      # error|warning, so the previous `--level basic` exited on a usage error without
+      # type-checking anything -- hidden by continue-on-error. The mode is left at the
+      # default: on this codebase basic and standard report the same 49 diagnostics.
+      - name: Pyright type check
+        run: pyright api/ --pythonversion 3.13
         continue-on-error: true
 
   # ---- Security / dependency audit ----
@@ -85,7 +96,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [quality]
 
     services:
       postgres:

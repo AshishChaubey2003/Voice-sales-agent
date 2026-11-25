@@ -1,0 +1,19 @@
+# Ruff configuration for this project.
+#
+# Before this file existed there was no ruff config at all, so `ruff check` ran on whatever
+# default rule set the installed ruff happened to ship. On 2026-11-25 that was ruff 0.17.6,
+# whose defaults span flake8-bugbear, flake8-simplify, pyupgrade, pylint and more, and CI
+# failed with 280 findings across code that predates any linting. Pin the version in
+# constraints-ci.txt and state the rules here instead of inheriting them.
+#
+# Selected: E (pycodestyle errors), F (Pyflakes), I (import sorting).
+line-length = 88
+
+[lint]
+select = ["E", "F", "I"]
+
+# E501 line-too-long is excluded deliberately. 3036 lines in api/ tests/ evals/ scripts/
+# voice/ exceed 88 columns, and line length is the formatter's concern, not the linter's --
+# ruff's own guidance is to leave E501 off when the formatter owns wrapping. Enabling it
+# would report 3092 findings instead of 56 while saying nothing about correctness.
+ignore = ["E501"]
