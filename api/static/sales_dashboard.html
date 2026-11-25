@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sales availability and handoff</title>
+<style nonce="__NONCE__">
+  :root { --bg:#f6f7f9; --fg:#1b1f24; --muted:#5b6672; --card:#fff; --line:#d9dde3; --ok:#17794a; --warn:#9a6700; --off:#6b7280; --accent:#1f5fbf; --bad:#b42318; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1318; --fg:#e8ebef; --muted:#9aa5b1; --card:#171c23; --line:#2a323c; --ok:#4cc38a; --warn:#e3b341; --off:#8b95a1; --accent:#6ea8fe; --bad:#ff7b72; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width: 1000px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; } h2 { font-size: 1.05rem; margin: 0 0 8px; }
+  p.sub { color:var(--muted); margin: 0 0 16px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:16px; }
+  input, select, textarea, button { font:inherit; color:inherit; background:var(--card); border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+  button { cursor:pointer; } button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin: 6px 0; }
+  .grow { flex:1 1 220px; }
+  .pill { display:inline-block; padding:1px 10px; border-radius:999px; font-size:.8rem; border:1px solid currentColor; }
+  .available { color:var(--ok); } .busy { color:var(--warn); } .offline { color:var(--off); }
+  .msg { padding:6px 10px; border-radius:6px; margin:4px 0; border:1px solid var(--line); white-space:pre-wrap; }
+  .msg.user { border-left:4px solid var(--accent); } .msg.human { border-left:4px solid var(--ok); } .msg.assistant { border-left:4px solid var(--off); }
+  .error { color:var(--bad); min-height:1.2em; } .empty { color:var(--muted); }
+  .kv { color:var(--muted); font-size:.85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Sales availability and handoff</h1>
+  <p class="sub">Paste your organization API key. It stays in this tab's memory only. Nothing is stored in the browser.</p>
+
+  <section aria-label="Connect">
+    <div class="row">
+      <label class="grow">API key <input id="key" type="password" autocomplete="off" class="grow" style="width:100%"></label>
+      <button id="connect" class="primary">Connect</button>
+    </div>
+    <div id="error" class="error" role="alert"></div>
+    <div id="summary" class="kv"></div>
+  </section>
+
+  <section aria-label="Sales team">
+    <h2>Sales team</h2>
+    <div id="reps"></div>
+    <form id="add-rep" class="row">
+      <input id="rep-name" placeholder="Name" required maxlength="200">
+      <input id="rep-email" type="email" placeholder="Email" required maxlength="320">
+      <button type="submit">Add rep</button>
+    </form>
+  </section>
+
+  <section aria-label="Handoff queue">
+    <h2>Handoff queue</h2>
+    <div id="handoffs"></div>
+  </section>
+
+  <section id="detail-section" aria-label="Conversation" hidden>
+    <h2>Conversation</h2>
+    <div id="detail-meta" class="kv"></div>
+    <div id="transcript"></div>
+    <div class="row">
+      <select id="reply-rep" aria-label="Reply as"></select>
+      <textarea id="reply-text" class="grow" rows="2" maxlength="2000" placeholder="Reply to the visitor"></textarea>
+      <button id="reply-send" class="primary">Send</button>
+    </div>
+  </section>
+</main>
+
+<script nonce="__NONCE__">
+(function () {
+  "use strict";
+  var apiKey = "";
+  var selected = null;
+  var timer = null;
+  var el = function (id) { return document.getElementById(id); };
+
+  function api(method, path, body) {
+    var options = { method: method, headers: { "Authorization": "Bearer " + apiKey } };
+    if (body !== undefined) { options.headers["Content-Type"] = "application/json"; options.body = JSON.stringify(body); }
+    return fetch(path, options).then(function (r) {
+      return r.text().then(function (t) {
+        var data = null; try { data = t ? JSON.parse(t) : null; } catch (e) { data = null; }
+        if (!r.ok) { var d = data && data.detail; throw new Error(typeof d === "string" ? d : "Request failed (" + r.status + ")"); }
+        return data;
+      });
+    });
+  }
+  function show(msg) { el("error").textContent = msg || ""; }
+  function node(tag, cls, text) { var n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; }
+  function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+  function guard(p) { return p.then(refresh).catch(function (e) { show(e.message); }); }
+
+  function renderReps(reps) {
+    var box = el("reps"); clear(box);
+    if (!reps.length) { box.appendChild(node("div", "empty", "No sales reps yet. Add one below.")); }
+    reps.forEach(function (rep) {
+      var row = node("div", "row");
+      row.appendChild(node("strong", "grow", rep.name));
+      row.appendChild(node("span", "kv", rep.email));
+      row.appendChild(node("span", "pill " + rep.status, rep.status));
+      ["available", "busy", "offline"].forEach(function (s) {
+        var b = node("button", "", s === "available" ? "Available" : s === "busy" ? "Busy" : "Offline");
+        b.disabled = rep.status === s;
+        b.addEventListener("click", function () { guard(api("PATCH", "/v1/sales/reps/" + rep.id + "/status", { status: s })); });
+        row.appendChild(b);
+      });
+      box.appendChild(row);
+    });
+    var sel = el("reply-rep"); var keep = sel.value; clear(sel);
+    reps.forEach(function (rep) { var o = node("option", "", rep.name + " (" + rep.status + ")"); o.value = rep.id; sel.appendChild(o); });
+    if (keep) sel.value = keep;
+  }
+
+  function renderHandoffs(items, reps) {
+    var box = el("handoffs"); clear(box);
+    var open = items.filter(function (h) { return h.status === "pending" || h.status === "assigned"; });
+    if (!open.length) { box.appendChild(node("div", "empty", "No open handoffs.")); }
+    open.forEach(function (h) {
+      var row = node("div", "row");
+      row.appendChild(node("span", "pill " + (h.status === "pending" ? "busy" : "available"), h.status));
+      row.appendChild(node("span", "grow", h.reason || "Visitor asked for a person"));
+      row.appendChild(node("span", "kv", "email: " + h.notification_status));
+      var view = node("button", "", "Open");
+      view.addEventListener("click", function () { selected = h.id; loadDetail(); });
+      row.appendChild(view);
+      if (h.status === "pending") {
+        var pick = node("select"); pick.setAttribute("aria-label", "Accept as");
+        reps.filter(function (r) { return r.status !== "offline"; }).forEach(function (r) { var o = node("option", "", r.name); o.value = r.id; pick.appendChild(o); });
+        var acc = node("button", "primary", "Accept");
+        acc.disabled = !pick.options.length;
+        acc.addEventListener("click", function () { guard(api("POST", "/v1/sales/handoffs/" + h.id + "/accept", { rep_id: pick.value })); });
+        row.appendChild(pick); row.appendChild(acc);
+      }
+      var done = node("button", "", "Resolve");
+      done.addEventListener("click", function () { guard(api("POST", "/v1/sales/handoffs/" + h.id + "/resolve")); });
+      row.appendChild(done);
+      box.appendChild(row);
+    });
+  }
+
+  function loadDetail() {
+    if (!selected) { el("detail-section").hidden = true; return Promise.resolve(); }
+    return api("GET", "/v1/sales/handoffs/" + selected).then(function (d) {
+      el("detail-section").hidden = false;
+      el("detail-meta").textContent = "Status: " + d.status + (d.reason ? " | Reason: " + d.reason : "");
+      var t = el("transcript"); clear(t);
+      d.messages.forEach(function (m) { t.appendChild(node("div", "msg " + m.role, m.role + ": " + m.content)); });
+      el("reply-send").disabled = d.status !== "assigned";
+    });
+  }
+
+  function refresh() {
+    show("");
+    return Promise.all([api("GET", "/v1/sales/reps"), api("GET", "/v1/sales/handoffs?limit=50"), api("GET", "/v1/sales/availability")]).then(function (r) {
+      renderReps(r[0]); renderHandoffs(r[1], r[0]);
+      el("summary").textContent = "Available: " + r[2].available_count + " | Busy: " + r[2].busy_count + " | Offline: " + r[2].offline_count;
+      return loadDetail();
+    }).catch(function (e) { show(e.message); });
+  }
+
+  el("connect").addEventListener("click", function () {
+    apiKey = el("key").value.trim(); el("key").value = "";
+    if (!apiKey) { show("Enter an API key."); return; }
+    if (timer) clearInterval(timer);
+    refresh().then(function () { timer = setInterval(refresh, 5000); });
+  });
+  el("add-rep").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    guard(api("POST", "/v1/sales/reps", { name: el("rep-name").value, email: el("rep-email").value }).then(function () { el("rep-name").value = ""; el("rep-email").value = ""; }));
+  });
+  el("reply-send").addEventListener("click", function () {
+    var text = el("reply-text").value.trim(); if (!text || !selected) return;
+    guard(api("POST", "/v1/sales/handoffs/" + selected + "/messages", { rep_id: el("reply-rep").value, content: text }).then(function () { el("reply-text").value = ""; }));
+  });
+})();
+</script>
+</body>
+</html>
