@@ -78,6 +78,9 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 20.0
     llm_max_output_tokens: int = 600
     chat_history_limit: int = 10
+    # "langgraph" (default) routes each text-chat turn through api/chat_graph.py; "legacy" keeps the
+    # original straight-line code path. Voice is unaffected by either.
+    chat_orchestrator: str = "langgraph"
 
     # Voice
     voice_agent_id: uuid.UUID | None = None
@@ -119,6 +122,14 @@ class Settings(BaseSettings):
     gemini_judge_model: str | None = None
     # Read timeout for Gemini judge calls only (seconds). Unset = 60. Independent of LLM_TIMEOUT_SECONDS.
     gemini_judge_timeout_seconds: float | None = None
+    # Human handoff email notification (off by default; see api/notifications.py). Not telephony.
+    handoff_email_enabled: bool = False
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = None
+    smtp_from: str | None = None
+    smtp_use_starttls: bool = True
     # Opt-in online monitoring (counts and timings only; see api/monitoring.py).
     online_monitoring: bool = False
     alert_webhook_url: str | None = None
