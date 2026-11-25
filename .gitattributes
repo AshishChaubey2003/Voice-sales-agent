@@ -1,1 +1,15 @@
 evals/datasets/*.jsonl text eol=lf
+
+# Normalize all text files to LF in the repo (CRLF on Windows checkout)
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.html text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.css text eol=lf
+*.toml text eol=lf
